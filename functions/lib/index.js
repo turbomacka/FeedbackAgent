@@ -200,19 +200,19 @@ async function logAudit(event, details) {
         ...details
     });
 }
-async function validateAccessToken(agentId, accessToken) {
+async function getAccessSession(agentId, accessToken) {
     if (!accessToken)
-        return false;
+        return null;
     const sessionSnap = await db.collection('accessSessions').doc(accessToken).get();
     if (!sessionSnap.exists)
-        return false;
+        return null;
     const data = sessionSnap.data() || {};
     if (data.agentId !== agentId)
-        return false;
+        return null;
     const expiresAt = data.expiresAt?.toMillis ? data.expiresAt.toMillis() : data.expiresAt;
     if (!expiresAt || Date.now() > expiresAt)
-        return false;
-    return true;
+        return null;
+    return { ref: sessionSnap.ref, data };
 }
 function normalizeText(text) {
     return text.replace(/\s+/g, ' ').trim();
@@ -732,6 +732,30 @@ apiRouter.post('/access/validate', async (req, res) => {
         return res.status(500).send(error.message || 'Failed to validate access.');
     }
 });
+apiRouter.post('/access/accept', async (req, res) => {
+    try {
+        const { agentId, accessToken } = req.body || {};
+        if (!agentId || typeof agentId !== 'string') {
+            return res.status(400).send('Missing agentId.');
+        }
+        if (!accessToken || typeof accessToken !== 'string') {
+            return res.status(400).send('Missing accessToken.');
+        }
+        const session = await getAccessSession(agentId, accessToken);
+        if (!session) {
+            return res.status(403).send('Invalid or expired access token.');
+        }
+        await session.ref.set({
+            acceptedAt: admin.firestore.FieldValue.serverTimestamp()
+        }, { merge: true });
+        await logAudit('access_session_started', { agentId });
+        return res.json({ ok: true });
+    }
+    catch (error) {
+        logger.error('Access accept error', error);
+        return res.status(500).send(error.message || 'Failed to accept access.');
+    }
+});
 apiRouter.post('/assessment', async (req, res) => {
     try {
         const { agentId, studentText, accessToken } = req.body || {};
@@ -747,8 +771,8 @@ apiRouter.post('/assessment', async (req, res) => {
         if (studentText.length > 20000) {
             return res.status(400).send('Student text is too long.');
         }
-        const accessOk = await validateAccessToken(agentId, accessToken);
-        if (!accessOk) {
+        const session = await getAccessSession(agentId, accessToken);
+        if (!session || !session.data?.acceptedAt) {
             return res.status(403).send('Invalid or expired access token.');
         }
         const agentSnap = await db.collection('agents').doc(agentId).get();

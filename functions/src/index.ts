@@ -180,15 +180,15 @@ async function logAudit(event: string, details: Record<string, unknown>) {
   });
 }
 
-async function validateAccessToken(agentId: string, accessToken: string) {
-  if (!accessToken) return false;
+async function getAccessSession(agentId: string, accessToken: string) {
+  if (!accessToken) return null;
   const sessionSnap = await db.collection('accessSessions').doc(accessToken).get();
-  if (!sessionSnap.exists) return false;
+  if (!sessionSnap.exists) return null;
   const data = sessionSnap.data() || {};
-  if (data.agentId !== agentId) return false;
+  if (data.agentId !== agentId) return null;
   const expiresAt = data.expiresAt?.toMillis ? data.expiresAt.toMillis() : data.expiresAt;
-  if (!expiresAt || Date.now() > expiresAt) return false;
-  return true;
+  if (!expiresAt || Date.now() > expiresAt) return null;
+  return { ref: sessionSnap.ref, data };
 }
 
 function normalizeText(text: string) {
@@ -762,6 +762,35 @@ apiRouter.post('/access/validate', async (req, res) => {
   }
 });
 
+apiRouter.post('/access/accept', async (req, res) => {
+  try {
+    const { agentId, accessToken } = req.body || {};
+    if (!agentId || typeof agentId !== 'string') {
+      return res.status(400).send('Missing agentId.');
+    }
+    if (!accessToken || typeof accessToken !== 'string') {
+      return res.status(400).send('Missing accessToken.');
+    }
+
+    const session = await getAccessSession(agentId, accessToken);
+    if (!session) {
+      return res.status(403).send('Invalid or expired access token.');
+    }
+
+    await session.ref.set(
+      {
+        acceptedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+    await logAudit('access_session_started', { agentId });
+    return res.json({ ok: true });
+  } catch (error: any) {
+    logger.error('Access accept error', error);
+    return res.status(500).send(error.message || 'Failed to accept access.');
+  }
+});
+
 apiRouter.post('/assessment', async (req, res) => {
   try {
     const { agentId, studentText, accessToken } = req.body || {};
@@ -778,8 +807,8 @@ apiRouter.post('/assessment', async (req, res) => {
       return res.status(400).send('Student text is too long.');
     }
 
-    const accessOk = await validateAccessToken(agentId, accessToken);
-    if (!accessOk) {
+    const session = await getAccessSession(agentId, accessToken);
+    if (!session || !session.data?.acceptedAt) {
       return res.status(403).send('Invalid or expired access token.');
     }
 

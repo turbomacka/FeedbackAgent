@@ -62,3 +62,10 @@ export async function validateAccessCode(
 ): Promise<{ accessToken: string }> {
   return postJson('/access/validate', { agentId, accessCode });
 }
+
+export async function acceptAccessSession(
+  agentId: string,
+  accessToken: string
+): Promise<{ ok: boolean }> {
+  return postJson('/access/accept', { agentId, accessToken });
+}
