@@ -17,6 +17,10 @@ service cloud.firestore {
       return signedIn() && get(/databases/$(database)/documents/agents/$(agentId)).data.ownerUid == request.auth.uid;
     }
 
+    function isUserSelf(userId) {
+      return signedIn() && request.auth.uid == userId;
+    }
+
     match /agents/{agentId} {
       allow read: if resource.data.isPublic == true || canView(resource);
       allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
@@ -39,7 +43,12 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow read, create, update: if signedIn() && request.auth.uid == userId;
+      allow read: if isUserSelf(userId);
+      allow create: if isUserSelf(userId)
+        && !request.resource.data.keys().hasAny(['isAuthorized', 'hasAcceptedTos', 'tosVersion', 'orgId', 'promoCodeId', 'authorizedAt', 'tosAcceptedAt', 'role']);
+      allow update: if isUserSelf(userId)
+        && !request.resource.data.diff(resource.data).changedKeys()
+          .hasAny(['isAuthorized', 'hasAcceptedTos', 'tosVersion', 'orgId', 'promoCodeId', 'authorizedAt', 'tosAcceptedAt', 'role']);
     }
 
     match /auditLogs/{logId} {
@@ -51,6 +60,14 @@ service cloud.firestore {
     }
 
     match /accessSessions/{sessionId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /promoCodes/{promoId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /organizations/{orgId} {
       allow read, create, update, delete: if false;
     }
   }

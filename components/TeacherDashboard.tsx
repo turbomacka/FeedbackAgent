@@ -5,6 +5,7 @@ import { deleteObject, ref, uploadBytes } from 'firebase/storage';
 import { Agent, ReferenceMaterial, Submission, StringencyLevel } from '../types';
 import { db, storage } from '../firebase';
 import { improveCriterion } from '../services/geminiService';
+import { createPromoCode, disablePromoCode, listPromoCodes, PromoCodeEntry } from '../services/teacherAuthService';
 import { EduTooltip } from './EduTooltip';
 
 interface TeacherDashboardProps {
@@ -12,6 +13,8 @@ interface TeacherDashboardProps {
   submissions: Submission[];
   currentUserEmail: string;
   currentUserUid: string;
+  isAdmin: boolean;
+  showAdminPanel: boolean;
   onCreateAgent: (agent: Agent) => Promise<void>;
   onUpdateAgent: (agent: Agent) => Promise<void>;
   language: 'sv' | 'en';
@@ -101,7 +104,7 @@ const InfoPopover = ({ text }: { text: string }) => {
   );
 };
 
-export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, submissions, currentUserEmail, currentUserUid, onCreateAgent, onUpdateAgent, language }) => {
+export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, submissions, currentUserEmail, currentUserUid, isAdmin, showAdminPanel, onCreateAgent, onUpdateAgent, language }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeInsightsId, setActiveInsightsId] = useState<string | null>(null);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -124,6 +127,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [showVerificationCode, setShowVerificationCode] = useState(true);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const [copiedAccessId, setCopiedAccessId] = useState<string | null>(null);
+  const [promoCodes, setPromoCodes] = useState<PromoCodeEntry[]>([]);
+  const [promoCodeInput, setPromoCodeInput] = useState('');
+  const [promoMaxUses, setPromoMaxUses] = useState('0');
+  const [promoOrgId, setPromoOrgId] = useState('');
+  const [promoBusy, setPromoBusy] = useState(false);
+  const [promoError, setPromoError] = useState<string | null>(null);
+  const [promoCopiedId, setPromoCopiedId] = useState<string | null>(null);
+  const [showManual, setShowManual] = useState(false);
+  const [showLmsInstructions, setShowLmsInstructions] = useState(false);
+  const [lmsLanguage, setLmsLanguage] = useState<'sv' | 'en'>('sv');
+  const [lmsCopyStatus, setLmsCopyStatus] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [draftCreatedId, setDraftCreatedId] = useState<string | null>(null);
 
@@ -163,6 +177,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     accessCodeRequired: { sv: 'Accesskod krävs.', en: 'Access code is required.' },
     accessCodeCopied: { sv: 'Kod kopierad!', en: 'Code copied!' },
     accessCodeBadge: { sv: 'Accesskod', en: 'Access code' },
+    promoAdminTitle: { sv: 'Admin: Promo-koder', en: 'Admin: Promo codes' },
+    promoAdminSubtitle: { sv: 'Skapa och hantera åtkomstkoder för lärare.', en: 'Create and manage teacher access codes.' },
+    promoAdminBadge: { sv: 'Admin', en: 'Admin' },
+    promoCodeField: { sv: 'Promo-kod', en: 'Promo code' },
+    promoCodeFieldPlaceholder: { sv: 'Låt systemet generera…', en: 'Let the system generate…' },
+    promoMaxUsesLabel: { sv: 'Max användningar', en: 'Max uses' },
+    promoMaxUsesHelp: { sv: '0 = obegränsat', en: '0 = unlimited' },
+    promoOrgLabel: { sv: 'Org-ID (valfritt)', en: 'Org ID (optional)' },
+    promoGenerate: { sv: 'Generera kod', en: 'Generate code' },
+    promoCreate: { sv: 'Skapa kod', en: 'Create code' },
+    promoDisable: { sv: 'Inaktivera', en: 'Disable' },
+    promoActive: { sv: 'Aktiv', en: 'Active' },
+    promoInactive: { sv: 'Inaktiv', en: 'Inactive' },
+    promoUses: { sv: 'Användningar', en: 'Uses' },
+    promoCopy: { sv: 'Kopiera', en: 'Copy' },
+    promoCopied: { sv: 'Kopierad!', en: 'Copied!' },
+    promoEmpty: { sv: 'Inga promo-koder ännu.', en: 'No promo codes yet.' },
+    passHelp: {
+      sv: 'Godkänd-gräns\n\nStyr när verifieringskoden räknas som godkänd. Det är inte procent eller betyg utan en intern skala (0–100 000) som matchar bedömningen mot dina kriterier.',
+      en: 'Pass threshold\n\nControls when the verification code counts as passed. It is not a percentage or grade, but an internal 0–100,000 scale that maps to your criteria.'
+    },
+    manualTooltip: { sv: 'Gör såhär', en: 'How to' },
+    manualClose: { sv: 'Stäng', en: 'Close' },
+    lmsButton: { sv: 'Instruktioner för LMS', en: 'LMS instructions' },
+    lmsTitle: { sv: 'Instruktioner till studenter', en: 'Student instructions' },
+    lmsCopy: { sv: 'Kopiera text', en: 'Copy text' },
+    lmsCopied: { sv: 'Kopierad!', en: 'Copied!' },
     criteriaLabel: { sv: 'Bedömningsstöd & Matriser', en: 'Criteria & Matrices' },
     criteriaPlaceholder: { sv: 'Namnge kriterium...', en: 'Name a criterion...' },
     aiMatrix: { sv: 'AI-matris', en: 'AI matrix' },
@@ -204,6 +245,128 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const t = (key: keyof typeof translations) => translations[key][language];
 
+  const manualContent = {
+    title: {
+      sv: 'Guide: Så skapar och förvaltar du din AI-agent',
+      en: 'Guide: How to build and manage your AI agent'
+    },
+    intro: {
+      sv: 'Denna guide hjälper dig att sätta upp en professionell lärprocess i fem enkla steg – från första instruktion till pedagogisk uppföljning.',
+      en: 'This guide helps you set up a professional learning flow in five clear steps — from first instructions to pedagogical follow-up.'
+    },
+    sections: [
+      {
+        title: language === 'sv' ? '1. Skapa din AI-agent 🏗️' : '1. Create your AI agent 🏗️',
+        body: language === 'sv' ? [
+          'Börja med att ge din agent ett namn och en tydlig uppgiftsbeskrivning.',
+          'Instruktioner: Beskriv uppgiften så att studenten förstår målet med reflektionen.',
+          'Kriterier: Definiera vad AI:n ska fokusera på i sin feedback. Vi rekommenderar att du använder AI-matrisen för att generera kvalitativa nivåer. Det säkerställer att återkopplingen blir nyanserad och direkt kopplad till kursens mål.'
+        ] : [
+          'Start by naming your agent and writing a clear task description.',
+          'Instructions: Explain the assignment so students understand the goal of the reflection.',
+          'Criteria: Define what the AI should focus on. We recommend using the AI matrix to generate qualitative levels so feedback is nuanced and aligned with course goals.'
+        ]
+      },
+      {
+        title: language === 'sv' ? '2. Addera referensmaterial (RAG) 📚' : '2. Add reference material (RAG) 📚',
+        body: language === 'sv' ? [
+          'Ladda upp det källmaterial som ska styra AI-agentens kunskap (Retrieval-Augmented Generation).',
+          'Träffsäkerhet: Relevant material gör feedbacken mer exakt och kursnära.',
+          'Kvalitet före kvantitet: Ladda endast upp material som är direkt nödvändigt för den specifika uppgiften. För mycket information kan göra AI:n mindre fokuserad och sänka relevansen i svaren.'
+        ] : [
+          'Upload the source material that should guide the agent’s knowledge (Retrieval-Augmented Generation).',
+          'Accuracy: Relevant material makes feedback more precise and course-aligned.',
+          'Quality over quantity: Upload only what is necessary for the specific task. Too much content can reduce focus and relevance.'
+        ]
+      },
+      {
+        title: language === 'sv' ? '3. Ställ in ramar och valideringslogik ⚙️' : '3. Set boundaries and validation logic ⚙️',
+        body: language === 'sv' ? [
+          'Här definierar du AI-agentens stringens och hur resultatet ska kommunicera med din lärplattform (t.ex. Canvas).',
+          'Stringens: Välj hur strikt AI:n ska vara i sin bedömning. En hög stringens är nödvändig för att motverka att AI:n blir för generös i sin feedback.',
+          'Valideringskod för LMS: Systemet genererar en unik kod till studenten efter avslutat arbete.',
+          'Logik: Du ställer in de första 3 siffrorna i koden. Om AI:n bedömer att studentens text når upp till nivån för "Godkänd", genereras en kod med ett numeriskt värde över den tröskel du har definierat. Vid "Underkänt" blir värdet under tröskeln.',
+          'I Canvas: Genom att skapa ett "test" i Canvas som matchar detta tröskelvärde kan du automatisera den summativa översikten och direkt se hur många studenter som uppnått målen.',
+          'Inlämning: Bocka för Inlämningsuppmaning om du vill att studentens slutgiltiga text ska bifogas tillsammans med valideringskoden.'
+        ] : [
+          'Define the agent’s strictness and how results should connect to your LMS (e.g., Canvas).',
+          'Strictness: Choose how strict the AI should be. Higher strictness helps avoid overly generous feedback.',
+          'LMS validation code: The system generates a unique code for the student after completion.',
+          'Logic: You set the first 3 digits of the code. If the AI deems the text “Passed,” the numeric value is above your threshold; otherwise it is below.',
+          'In Canvas: Create a “quiz” that matches the threshold to automate the pass overview.',
+          'Submission: Enable submission prompt if you want the student’s final text attached with the validation code.'
+        ]
+      },
+      {
+        title: language === 'sv' ? '4. Dela och publicera till studenter 🔗' : '4. Share and publish to students 🔗',
+        body: language === 'sv' ? [
+          'När du är nöjd med inställningarna är det dags att göra agenten tillgänglig.',
+          'Inbäddning (i-frame): Varje agent har en unik inbäddningskod. Kopiera denna och klistra in den direkt på en sida i din kursmodul i Canvas eller annat LMS. Detta gör att studenterna kan arbeta i en bekant miljö utan externa hopp.',
+          'Säkerhet med Accesskod: För att förhindra obehörig åtkomst och skydda din data krävs en accesskod för att starta chatten. Utan denna kod riskerar dina pedagogiska insikter att kontamineras av utomstående.',
+          'Distribution av kod: Ett effektivt sätt är att skriva ut accesskoden i klartext i Canvas, precis ovanför den inbäddade agenten.',
+          'Exempel: "Använd koden [DIN-KOD] för att låsa upp din AI-tutor nedan."'
+        ] : [
+          'When you are happy with the settings, it’s time to make the agent available.',
+          'Embedding (i-frame): Each agent has a unique embed code. Paste it directly into a Canvas page or any LMS so students can work in a familiar environment.',
+          'Access code security: An access code is required to start the chat. Without it, your insights can be contaminated by outsiders.',
+          'Code distribution: A simple method is to display the access code in Canvas just above the embedded agent.',
+          'Example: “Use the code [YOUR-CODE] to unlock the AI tutor below.”'
+        ]
+      },
+      {
+        title: language === 'sv' ? '5. Följ upp med pedagogiska insikter 📊' : '5. Follow up with pedagogical insights 📊',
+        body: language === 'sv' ? [
+          'Använd den insamlade datan för att utveckla undervisningen och identifiera behov i studentgruppen.',
+          'Lärarpanelen: På agentens kort hittar du aggregerade insikter som sammanfattar klassens styrkor, vanliga missförstånd och förslag på nästa steg.',
+          'Planering: Använd dessa insikter som underlag för att anpassa din nästa föreläsning eller lektion efter var studenterna faktiskt befinner sig i sin lärprocess.'
+        ] : [
+          'Use the collected data to improve teaching and identify student needs.',
+          'Teacher panel: Each agent card shows aggregated insights on strengths, common misconceptions, and suggested next steps.',
+          'Planning: Use these insights to adapt your next lecture or lesson to where students actually are in their learning process.'
+        ]
+      }
+    ]
+  };
+
+  const buildLmsInstructions = (lang: 'sv' | 'en') => {
+    const accessCode = lang === 'sv' ? '[KLISTRA IN DIN ACCESSKOD HÄR]' : '[PASTE YOUR ACCESS CODE HERE]';
+    if (lang === 'sv') {
+      return [
+        'Syfte och funktion',
+        'Syftet med verktyget är att erbjuda omedelbar formativ feedback. AI-tutorn utgår strikt från uppgiftens instruktioner, formaliakrav och de specifika bedömningskriterier som läraren har definierat. Genom att analysera ditt arbete utifrån dessa parametrar utmanar systemet dina slutsatser och föreslår områden för fördjupning. Målet är att stödja din kritiska reflektion och säkerställa att ditt arbete lever upp till de ställda kraven.',
+        '',
+        'Instruktioner för genomförande',
+        `Åtkomst: Ange accesskoden ${accessCode} för att aktivera verktyget nedan.`,
+        'Dialog och feedback: Presentera ditt utkast eller dina resonemang för tutorn. Systemet är programmerat att ge vägledande frågor och observationer baserat på lärarens kriterier snarare än att ge färdiga svar.',
+        'Revidering: Använd den återkoppling du får för att bearbeta och förfina din text direkt i verktyget.',
+        'Generering av valideringskod: När du har genomfört en tillräcklig bearbetning och systemet bedömer att arbetet möter uppgiftens krav, genereras en unik valideringskod.',
+        'Inlämning: Kopiera koden och lämna in den i den angivna uppgiften i lärplattformen. Koden fungerar som bekräftelse på att du har genomgått den obligatoriska reflektionsprocessen.',
+        '',
+        'Integritet och datasäkerhet',
+        'Anonymitet: Systemet hanterar dina uppgifter anonymt. Som lärare har jag endast tillgång till chattloggar och statistik på aggregerad nivå för att kunna identifiera generella behov i studentgruppen. Din identitet kopplas till din process först när du lämnar in din valideringskod i lärplattformen.',
+        'Personuppgifter: Ange aldrig personuppgifter såsom namn, personnummer eller adress i chatten, då texterna bearbetas av en extern AI-tjänst.',
+        'Kritiskt förhållningssätt: AI-tutorn är ett pedagogiskt hjälpmedel, inte ett facit. Det är din uppgift att kritiskt värdera den feedback du får och säkerställa att det slutgiltiga arbetet följer alla givna instruktioner och representerar din egen kunskap.'
+      ].join('\n');
+    }
+
+    return [
+      'Purpose and function',
+      'The purpose of the tool is to provide immediate formative feedback. The AI tutor strictly follows the assignment instructions, formal requirements, and the specific assessment criteria defined by the teacher. By analysing your work against these parameters, the system challenges your conclusions and suggests areas for deeper reflection. The goal is to support your critical thinking and ensure your work meets the stated requirements.',
+      '',
+      'Instructions for completion',
+      `Access: Enter the access code ${accessCode} to activate the tool below.`,
+      'Dialogue and feedback: Present your draft or your reasoning to the tutor. The system is programmed to provide guiding questions and observations based on the teacher’s criteria rather than giving ready-made answers.',
+      'Revision: Use the feedback you receive to revise and refine your text directly in the tool.',
+      'Validation code generation: When you have completed sufficient revisions and the system assesses that your work meets the requirements, a unique validation code is generated.',
+      'Submission: Copy the code and submit it in the specified assignment in the LMS. The code confirms that you have completed the required reflection process.',
+      '',
+      'Integrity and data security',
+      'Anonymity: The system handles your work anonymously. As a teacher, I only have access to chat logs and aggregated statistics to identify general needs in the student group. Your identity is linked only when you submit your validation code in the LMS.',
+      'Personal data: Never enter personal data such as name, social security number, or address in the chat, since the text is processed by an external AI service.',
+      'Critical stance: The AI tutor is a pedagogical aid, not an answer key. It is your responsibility to critically evaluate the feedback and ensure the final work follows all instructions and represents your own knowledge.'
+    ].join('\n');
+  };
+
   const normalizeAccessCode = (value: string) =>
     value.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
 
@@ -215,6 +378,76 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       result += chars[Math.floor(Math.random() * chars.length)];
     }
     return result;
+  };
+
+  const generatePromoCode = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let result = '';
+    for (let i = 0; i < 8; i += 1) {
+      result += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return result;
+  };
+
+  const refreshPromoCodes = useCallback(async () => {
+    if (!isAdmin) return;
+    setPromoError(null);
+    setPromoBusy(true);
+    try {
+      const codes = await listPromoCodes();
+      setPromoCodes(codes);
+    } catch (err: any) {
+      setPromoError(err?.message || (language === 'sv' ? 'Kunde inte hämta koder.' : 'Failed to load codes.'));
+    } finally {
+      setPromoBusy(false);
+    }
+  }, [isAdmin, language]);
+
+  useEffect(() => {
+    if (isAdmin) {
+      void refreshPromoCodes();
+    }
+  }, [isAdmin, refreshPromoCodes]);
+
+  const handleCreatePromoCode = async () => {
+    setPromoError(null);
+    setPromoBusy(true);
+    try {
+      const normalized = promoCodeInput.trim() ? normalizeAccessCode(promoCodeInput) : undefined;
+      const maxUsesValue = Number(promoMaxUses);
+      const payload: { code?: string; maxUses?: number; orgId?: string | null } = {};
+      if (normalized) payload.code = normalized;
+      if (Number.isFinite(maxUsesValue)) payload.maxUses = maxUsesValue;
+      if (promoOrgId.trim()) payload.orgId = promoOrgId.trim();
+      await createPromoCode(payload);
+      setPromoCodeInput('');
+      setPromoOrgId('');
+      setPromoMaxUses('0');
+      await refreshPromoCodes();
+    } catch (err: any) {
+      setPromoError(err?.message || (language === 'sv' ? 'Kunde inte skapa kod.' : 'Failed to create code.'));
+    } finally {
+      setPromoBusy(false);
+    }
+  };
+
+  const handleDisablePromoCode = async (code: string) => {
+    setPromoError(null);
+    setPromoBusy(true);
+    try {
+      await disablePromoCode(code);
+      await refreshPromoCodes();
+    } catch (err: any) {
+      setPromoError(err?.message || (language === 'sv' ? 'Kunde inte inaktivera.' : 'Failed to disable.'));
+    } finally {
+      setPromoBusy(false);
+    }
+  };
+
+  const handleCopyPromoCode = (code: string) => {
+    navigator.clipboard.writeText(code);
+    setPromoCopiedId(code);
+    setTimeout(() => setPromoCopiedId(null), 1500);
   };
 
   const upsertAccessCode = async (agentId: string, code: string) => {
@@ -527,21 +760,162 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   return (
     <div className="max-w-6xl mx-auto p-4 space-y-12">
-      <header className="flex justify-between items-center bg-white p-10 rounded-[2.5rem] border border-slate-100 shadow-sm">
+      <header className="flex flex-wrap justify-between items-center gap-6 bg-white p-10 rounded-[2.5rem] border border-slate-100 shadow-sm">
         <div>
           <h1 className="text-3xl font-black text-slate-900 tracking-tight">{t('manageAgent')}</h1>
           <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest mt-1">Skapa och redigera dina feedback-assistenter</p>
         </div>
-        <button
-          onClick={() => {
-            resetDraftForm();
-            setIsModalOpen(true);
-          }}
-          className="bg-indigo-600 hover:bg-indigo-700 text-white px-10 py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest shadow-xl"
-        >
-          Ny Agent
-        </button>
+        <div className="flex items-center gap-3">
+          <EduTooltip text={t('manualTooltip')}>
+            <button
+              type="button"
+              onClick={() => setShowManual(true)}
+              className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center"
+              aria-label={t('manualTooltip')}
+            >
+              <i className="fas fa-book-open text-lg"></i>
+            </button>
+          </EduTooltip>
+          <EduTooltip text={t('lmsButton')}>
+            <button
+              type="button"
+              onClick={() => {
+                setLmsLanguage(language);
+                setShowLmsInstructions(true);
+                setLmsCopyStatus(false);
+              }}
+              className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center"
+              aria-label={t('lmsButton')}
+            >
+              <i className="fas fa-file-alt text-lg"></i>
+            </button>
+          </EduTooltip>
+          <button
+            onClick={() => {
+              resetDraftForm();
+              setIsModalOpen(true);
+            }}
+            className="bg-indigo-600 hover:bg-indigo-700 text-white px-10 py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest shadow-xl"
+          >
+            Ny Agent
+          </button>
+        </div>
       </header>
+
+      {isAdmin && showAdminPanel && (
+        <section className="bg-white rounded-[2.5rem] p-10 border border-slate-100 shadow-sm space-y-8">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h2 className="text-xl font-black text-slate-900 tracking-tight">{t('promoAdminTitle')}</h2>
+              <p className="text-slate-500 text-sm font-medium">{t('promoAdminSubtitle')}</p>
+            </div>
+            <span className="text-[9px] font-black uppercase tracking-widest text-indigo-600 bg-indigo-50 border border-indigo-100 px-3 py-1 rounded-full">
+              {t('promoAdminBadge')}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('promoCodeField')}</label>
+              <input
+                type="text"
+                value={promoCodeInput}
+                onChange={(e) => setPromoCodeInput(e.target.value)}
+                placeholder={t('promoCodeFieldPlaceholder')}
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 font-black uppercase tracking-widest text-sm placeholder:text-slate-300"
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('promoMaxUsesLabel')}</label>
+              <input
+                type="number"
+                min={0}
+                value={promoMaxUses}
+                onChange={(e) => setPromoMaxUses(e.target.value)}
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 font-black text-sm"
+              />
+              <p className="text-[9px] text-slate-400 font-semibold uppercase tracking-widest">{t('promoMaxUsesHelp')}</p>
+            </div>
+            <div className="space-y-2">
+              <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('promoOrgLabel')}</label>
+              <input
+                type="text"
+                value={promoOrgId}
+                onChange={(e) => setPromoOrgId(e.target.value)}
+                className="w-full px-4 py-3 rounded-xl border border-slate-200 bg-slate-50 font-black text-sm"
+              />
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-3">
+            <button
+              type="button"
+              onClick={() => setPromoCodeInput(generatePromoCode())}
+              className="px-5 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest border border-slate-200 text-slate-700 hover:bg-slate-50"
+            >
+              {t('promoGenerate')}
+            </button>
+            <button
+              type="button"
+              onClick={handleCreatePromoCode}
+              disabled={promoBusy}
+              className={`px-6 py-3 rounded-xl text-[10px] font-black uppercase tracking-widest text-white ${
+                promoBusy ? 'bg-gray-400' : 'bg-indigo-600 hover:bg-indigo-700'
+              }`}
+            >
+              {t('promoCreate')}
+            </button>
+          </div>
+
+          {promoError && (
+            <p className="text-[10px] font-black uppercase tracking-widest text-red-500">{promoError}</p>
+          )}
+
+          <div className="space-y-3">
+            {promoCodes.length === 0 ? (
+              <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('promoEmpty')}</div>
+            ) : (
+              promoCodes.map(code => (
+                <div key={code.id} className="flex flex-wrap items-center justify-between gap-4 bg-slate-50/70 border border-slate-100 rounded-2xl px-5 py-4">
+                  <div className="space-y-1">
+                    <div className="flex flex-wrap items-center gap-3">
+                      <code className="bg-white px-3 py-1 rounded-lg text-sm font-black tracking-widest">{code.code}</code>
+                      <span className={`text-[9px] font-black uppercase tracking-widest px-2.5 py-0.5 rounded-full border ${
+                        code.active ? 'border-emerald-200 text-emerald-700 bg-emerald-50' : 'border-slate-200 text-slate-500 bg-slate-100'
+                      }`}>
+                        {code.active ? t('promoActive') : t('promoInactive')}
+                      </span>
+                    </div>
+                    <div className="text-[9px] font-black uppercase tracking-widest text-slate-400">
+                      {t('promoUses')}: {code.currentUses}/{code.maxUses > 0 ? code.maxUses : '∞'}
+                      {code.orgId ? ` • ${code.orgId}` : ''}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handleCopyPromoCode(code.code)}
+                      className="text-[9px] font-black uppercase tracking-widest text-indigo-600 hover:text-indigo-800"
+                    >
+                      {promoCopiedId === code.code ? t('promoCopied') : t('promoCopy')}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!code.active || promoBusy}
+                      onClick={() => handleDisablePromoCode(code.code)}
+                      className={`text-[9px] font-black uppercase tracking-widest ${
+                        !code.active || promoBusy ? 'text-slate-300' : 'text-red-500 hover:text-red-700'
+                      }`}
+                    >
+                      {t('promoDisable')}
+                    </button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </section>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10">
         {agents.map(agent => (
@@ -586,6 +960,111 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
           </div>
         ))}
       </div>
+
+      {showManual && (
+        <div className="fixed inset-0 z-[90] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-300">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl border border-slate-100 w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="p-8 border-b border-slate-100 flex items-start justify-between gap-6">
+              <div>
+                <h3 className="text-2xl font-black text-slate-900 tracking-tight">{manualContent.title[language]}</h3>
+                <p className="text-sm text-slate-500 font-medium mt-2">{manualContent.intro[language]}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowManual(false)}
+                className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"
+              >
+                <i className="fas fa-times text-xl"></i>
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar">
+              {manualContent.sections.map((section, idx) => (
+                <div key={idx} className="space-y-3">
+                  <h4 className="text-[11px] font-black uppercase tracking-widest text-indigo-700">{section.title}</h4>
+                  <div className="space-y-2 text-sm text-slate-600 font-medium leading-relaxed">
+                    {section.body.map((line, lineIdx) => (
+                      <p key={lineIdx}>{line}</p>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowManual(false)}
+                className="px-6 py-3 rounded-xl bg-indigo-600 text-white font-black text-[10px] uppercase tracking-widest"
+              >
+                {t('manualClose')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLmsInstructions && (
+        <div className="fixed inset-0 z-[90] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-6 animate-in fade-in duration-300">
+          <div className="bg-white rounded-[2.5rem] shadow-2xl border border-slate-100 w-full max-w-4xl max-h-[90vh] overflow-hidden flex flex-col">
+            <div className="p-8 border-b border-slate-100 flex items-start justify-between gap-6">
+              <div>
+                <h3 className="text-2xl font-black text-slate-900 tracking-tight">{t('lmsTitle')}</h3>
+                <p className="text-sm text-slate-500 font-medium mt-2">{t('lmsButton')}</p>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+                  <button
+                    type="button"
+                    onClick={() => setLmsLanguage('sv')}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${lmsLanguage === 'sv' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                  >
+                    SV
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setLmsLanguage('en')}
+                    className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${lmsLanguage === 'en' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                  >
+                    EN
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setShowLmsInstructions(false)}
+                  className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"
+                >
+                  <i className="fas fa-times text-xl"></i>
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto p-8">
+              <pre className="whitespace-pre-wrap text-sm text-slate-700 font-medium leading-relaxed">
+                {buildLmsInstructions(lmsLanguage)}
+              </pre>
+            </div>
+            <div className="p-6 border-t border-slate-100 bg-slate-50 flex items-center justify-between gap-4">
+              <button
+                type="button"
+                onClick={() => {
+                  const text = buildLmsInstructions(lmsLanguage);
+                  navigator.clipboard.writeText(text);
+                  setLmsCopyStatus(true);
+                  setTimeout(() => setLmsCopyStatus(false), 1500);
+                }}
+                className="px-6 py-3 rounded-xl bg-indigo-600 text-white font-black text-[10px] uppercase tracking-widest"
+              >
+                {lmsCopyStatus ? t('lmsCopied') : t('lmsCopy')}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowLmsInstructions(false)}
+                className="px-6 py-3 rounded-xl bg-white text-indigo-700 border border-indigo-200 font-black text-[10px] uppercase tracking-widest"
+              >
+                {t('manualClose')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* INSIGHTS MODAL */}
       {activeInsightsId && activeAgent && (
@@ -724,9 +1203,36 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
               </div>
             )}
 
+
             <div className="p-10 border-b border-slate-50 flex justify-between items-center bg-white shrink-0">
               <h2 className="text-[11px] font-black text-slate-400 uppercase tracking-[0.3em]">{editingAgentId ? 'Redigera Agent' : 'Skapa Ny Agent'}</h2>
-              <button onClick={() => void handleCloseModal()} className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"><i className="fas fa-times text-xl"></i></button>
+              <div className="flex items-center gap-3">
+                <EduTooltip text={t('manualTooltip')}>
+                  <button
+                    type="button"
+                    onClick={() => setShowManual(true)}
+                    className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center"
+                    aria-label={t('manualTooltip')}
+                  >
+                    <i className="fas fa-book-open text-lg"></i>
+                  </button>
+                </EduTooltip>
+                <EduTooltip text={t('lmsButton')}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLmsLanguage(language);
+                      setShowLmsInstructions(true);
+                      setLmsCopyStatus(false);
+                    }}
+                    className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-indigo-600 transition-all flex items-center justify-center"
+                    aria-label={t('lmsButton')}
+                  >
+                    <i className="fas fa-file-alt text-lg"></i>
+                  </button>
+                </EduTooltip>
+                <button onClick={() => void handleCloseModal()} className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"><i className="fas fa-times text-xl"></i></button>
+              </div>
             </div>
             
             <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-14 space-y-16 custom-scrollbar">
@@ -837,7 +1343,10 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   </div>
 
                   <div className="space-y-4">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('passLabel')}</label>
+                    <div className="flex items-center gap-2 ml-1">
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{t('passLabel')}</label>
+                      <InfoPopover text={t('passHelp')} />
+                    </div>
                     <div className="flex items-center gap-6">
                       <input type="range" min="0" max="100000" step="5000" className="flex-1 accent-indigo-600" value={passThreshold} onChange={e => setPassThreshold(Number(e.target.value))} />
                       <span className="text-xl font-black text-indigo-600 w-20 text-right">{(passThreshold/1000).toFixed(0)}k</span>

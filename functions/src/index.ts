@@ -48,6 +48,8 @@ const EMBEDDING_BATCH_SIZE = 100;
 const EMBEDDING_BATCH_TOKEN_LIMIT = 18000;
 const DOC_AI_PAGE_LIMIT = 30;
 const ACCESS_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
+const TOS_VERSION = 'v1-2026-01';
+const PROMO_CODE_LENGTH = 8;
 
 const db = admin.firestore();
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
@@ -180,6 +182,32 @@ async function logAudit(event: string, details: Record<string, unknown>) {
   });
 }
 
+async function requireAuth(req: express.Request, res: express.Response) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) {
+    res.status(401).send('Missing auth token.');
+    return null;
+  }
+  const token = header.slice('Bearer '.length);
+  try {
+    return await admin.auth().verifyIdToken(token);
+  } catch {
+    res.status(401).send('Invalid auth token.');
+    return null;
+  }
+}
+
+async function requireAdmin(req: express.Request, res: express.Response) {
+  const authUser = await requireAuth(req, res);
+  if (!authUser) return null;
+  const userSnap = await db.collection('users').doc(authUser.uid).get();
+  if (!userSnap.exists || userSnap.data()?.role !== 'admin') {
+    res.status(403).send('Admin access required.');
+    return null;
+  }
+  return authUser;
+}
+
 async function getAccessSession(agentId: string, accessToken: string) {
   if (!accessToken) return null;
   const sessionSnap = await db.collection('accessSessions').doc(accessToken).get();
@@ -197,6 +225,15 @@ function normalizeText(text: string) {
 
 function normalizeAccessCode(value: string) {
   return value.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+}
+
+function generatePromoCode(length = PROMO_CODE_LENGTH) {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let result = '';
+  for (let i = 0; i < length; i += 1) {
+    result += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return result;
 }
 
 function decodeEntities(text: string) {
@@ -788,6 +825,210 @@ apiRouter.post('/access/accept', async (req, res) => {
   } catch (error: any) {
     logger.error('Access accept error', error);
     return res.status(500).send(error.message || 'Failed to accept access.');
+  }
+});
+
+apiRouter.get('/teacher/promo-codes', async (req, res) => {
+  try {
+    const authUser = await requireAdmin(req, res);
+    if (!authUser) return;
+    const limitParam = Number(req.query.limit || 25);
+    const limit = Number.isFinite(limitParam) ? Math.min(Math.max(limitParam, 1), 100) : 25;
+
+    const snapshot = await db
+      .collection('promoCodes')
+      .orderBy('createdAt', 'desc')
+      .limit(limit)
+      .get();
+
+    const codes = snapshot.docs.map(docSnap => {
+      const data = docSnap.data() || {};
+      return {
+        id: docSnap.id,
+        code: typeof data.code === 'string' ? data.code : docSnap.id,
+        active: data.active !== false,
+        maxUses: Number(data.maxUses ?? 0),
+        currentUses: Number(data.currentUses ?? 0),
+        orgId: data.orgId || null,
+        createdAt: data.createdAt?.toMillis ? data.createdAt.toMillis() : null
+      };
+    });
+
+    return res.json({ codes });
+  } catch (error: any) {
+    logger.error('Promo code list error', error);
+    return res.status(500).send(error.message || 'Failed to list promo codes.');
+  }
+});
+
+apiRouter.post('/teacher/promo-codes', async (req, res) => {
+  try {
+    const authUser = await requireAdmin(req, res);
+    if (!authUser) return;
+
+    const { code, maxUses, orgId } = req.body || {};
+    const normalized = code ? normalizeAccessCode(String(code)) : generatePromoCode();
+    if (!normalized) {
+      return res.status(400).send('Invalid promo code.');
+    }
+
+    const maxUsesValue = Number.isFinite(Number(maxUses)) ? Math.max(0, Math.floor(Number(maxUses))) : 0;
+    const promoRef = db.collection('promoCodes').doc(normalized);
+    const existing = await promoRef.get();
+    if (existing.exists) {
+      return res.status(409).send('Promo code already exists.');
+    }
+
+    await promoRef.set({
+      code: normalized,
+      active: true,
+      maxUses: maxUsesValue,
+      currentUses: 0,
+      orgId: orgId || null,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      createdBy: authUser.uid,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    await logAudit('promo_code_created', { uid: authUser.uid, promoCode: normalized });
+    return res.json({ code: normalized });
+  } catch (error: any) {
+    logger.error('Promo code create error', error);
+    return res.status(500).send(error.message || 'Failed to create promo code.');
+  }
+});
+
+apiRouter.post('/teacher/promo-codes/disable', async (req, res) => {
+  try {
+    const authUser = await requireAdmin(req, res);
+    if (!authUser) return;
+
+    const { code } = req.body || {};
+    const normalized = code ? normalizeAccessCode(String(code)) : '';
+    if (!normalized) {
+      return res.status(400).send('Missing promo code.');
+    }
+
+    const promoRef = db.collection('promoCodes').doc(normalized);
+    const promoSnap = await promoRef.get();
+    if (!promoSnap.exists) {
+      return res.status(404).send('Promo code not found.');
+    }
+
+    await promoRef.set(
+      { active: false, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
+    await logAudit('promo_code_disabled', { uid: authUser.uid, promoCode: normalized });
+    return res.json({ ok: true });
+  } catch (error: any) {
+    logger.error('Promo code disable error', error);
+    return res.status(500).send(error.message || 'Failed to disable promo code.');
+  }
+});
+
+apiRouter.post('/teacher/authorize', async (req, res) => {
+  try {
+    const authUser = await requireAuth(req, res);
+    if (!authUser) return;
+
+    const { promoCode } = req.body || {};
+    if (!promoCode || typeof promoCode !== 'string') {
+      return res.status(400).send('Missing promoCode.');
+    }
+
+    const normalized = normalizeAccessCode(promoCode);
+    if (!normalized) {
+      return res.status(400).send('Invalid promoCode.');
+    }
+
+    const promoRef = db.collection('promoCodes').doc(normalized);
+    const userRef = db.collection('users').doc(authUser.uid);
+
+    await db.runTransaction(async (tx) => {
+      const promoSnap = await tx.get(promoRef);
+      if (!promoSnap.exists) {
+        throw new Error('Invalid promo code.');
+      }
+      const promo = promoSnap.data() || {};
+      const active = promo.active !== false;
+      const maxUses = Number(promo.maxUses ?? 0);
+      const currentUses = Number(promo.currentUses ?? 0);
+      const userSnap = await tx.get(userRef);
+      const alreadyAuthorized = userSnap.exists && userSnap.data()?.isAuthorized === true;
+
+      if (!active) {
+        throw new Error('Promo code inactive.');
+      }
+      if (!alreadyAuthorized && maxUses > 0 && currentUses >= maxUses) {
+        throw new Error('Promo code exhausted.');
+      }
+
+      if (!alreadyAuthorized) {
+        tx.set(
+          promoRef,
+          {
+            currentUses: admin.firestore.FieldValue.increment(1),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+          },
+          { merge: true }
+        );
+      }
+
+      tx.set(
+        userRef,
+        {
+          email: authUser.email || '',
+          isAuthorized: true,
+          promoCodeId: promoRef.id,
+          orgId: promo.orgId || null,
+          authorizedAt: admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        },
+        { merge: true }
+      );
+    });
+
+    await logAudit('teacher_authorized', { uid: authUser.uid, promoCode: normalized });
+    return res.json({ ok: true });
+  } catch (error: any) {
+    logger.error('Teacher authorize error', error);
+    return res.status(403).send(error.message || 'Failed to authorize.');
+  }
+});
+
+apiRouter.post('/teacher/accept-tos', async (req, res) => {
+  try {
+    const authUser = await requireAuth(req, res);
+    if (!authUser) return;
+
+    const { tosVersion } = req.body || {};
+    if (!tosVersion || typeof tosVersion !== 'string') {
+      return res.status(400).send('Missing tosVersion.');
+    }
+
+    const userRef = db.collection('users').doc(authUser.uid);
+    const userSnap = await userRef.get();
+    if (!userSnap.exists || userSnap.data()?.isAuthorized !== true) {
+      return res.status(403).send('Not authorized.');
+    }
+
+    await userRef.set(
+      {
+        hasAcceptedTos: true,
+        tosVersion,
+        tosAcceptedAt: admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+
+    await logAudit('teacher_tos_accepted', { uid: authUser.uid, tosVersion });
+    return res.json({ ok: true, tosVersion: TOS_VERSION });
+  } catch (error: any) {
+    logger.error('Teacher TOS accept error', error);
+    return res.status(500).send(error.message || 'Failed to accept TOS.');
   }
 });
 

@@ -1,12 +1,15 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { onAuthStateChanged, signInWithPopup, signOut, User } from 'firebase/auth';
+import { getRedirectResult, onAuthStateChanged, signInWithPopup, signInWithRedirect, signOut, User } from 'firebase/auth';
 import { arrayUnion, collection, doc, onSnapshot, query, serverTimestamp, setDoc, updateDoc, where } from 'firebase/firestore';
 import { Agent, Submission } from './types';
 import { TeacherDashboard } from './components/TeacherDashboard';
 import { StudentView } from './components/StudentView';
 import { LoginPortal } from './components/LoginPortal';
+import { PromoCodeGate } from './components/PromoCodeGate';
+import { TeacherTosModal } from './components/TeacherTosModal';
 import { auth, db, googleProvider } from './firebase';
+import { authorizeTeacher, acceptTeacherTos } from './services/teacherAuthService';
 
 const App: React.FC = () => {
   const [view, setView] = useState<'teacher' | 'student'>('teacher');
@@ -15,6 +18,13 @@ const App: React.FC = () => {
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [activeAgent, setActiveAgent] = useState<Agent | null>(null);
   const [language, setLanguage] = useState<'sv' | 'en'>('sv');
+
+  const TOS_VERSION = 'v1-2026-01';
+  const [userProfile, setUserProfile] = useState<Record<string, any> | null>(null);
+  const [promoError, setPromoError] = useState<string | null>(null);
+  const [promoBusy, setPromoBusy] = useState(false);
+  const [tosBusy, setTosBusy] = useState(false);
+  const [showAdminPanel, setShowAdminPanel] = useState(false);
   
   // Auth state
   const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -23,9 +33,11 @@ const App: React.FC = () => {
 
   const translations = {
     teacherPortal: { sv: 'Lärarportal', en: 'Teacher Portal' },
+    adminPanel: { sv: 'Admin', en: 'Admin' },
     logout: { sv: 'Logga ut', en: 'Log out' },
     notFound: { sv: 'Agent hittades inte', en: 'Agent not found' },
-    back: { sv: 'Tillbaka', en: 'Back' }
+    back: { sv: 'Tillbaka', en: 'Back' },
+    loadingProfile: { sv: 'Laddar konto...', en: 'Loading account...' }
   };
 
   const t = (key: keyof typeof translations) => translations[key][language];
@@ -33,6 +45,7 @@ const App: React.FC = () => {
   const userInitials = userLabel
     ? userLabel.split(' ').map(part => part[0]).join('').toUpperCase()
     : 'U';
+  const isAdmin = userProfile?.role === 'admin';
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (nextUser) => {
@@ -40,6 +53,18 @@ const App: React.FC = () => {
       setIsLoggedIn(Boolean(nextUser));
     });
     return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    getRedirectResult(auth).catch((err) => {
+      if (active) {
+        setAuthError(err?.message || 'Login failed.');
+      }
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -82,6 +107,7 @@ const App: React.FC = () => {
     if (!user) {
       setAgents([]);
       setSubmissions([]);
+      setUserProfile(null);
       return;
     }
 
@@ -115,6 +141,15 @@ const App: React.FC = () => {
   }, [user]);
 
   useEffect(() => {
+    if (!user) return;
+    const userRef = doc(db, 'users', user.uid);
+    const unsub = onSnapshot(userRef, (snapshot) => {
+      setUserProfile(snapshot.exists() ? snapshot.data() : null);
+    });
+    return () => unsub();
+  }, [user]);
+
+  useEffect(() => {
     if (!activeAgentId) {
       setActiveAgent(null);
       return;
@@ -136,13 +171,37 @@ const App: React.FC = () => {
   useEffect(() => {
     if (!user) return;
     const profileRef = doc(db, 'users', user.uid);
-    void setDoc(profileRef, {
+    const payload: Record<string, unknown> = {
       email: user.email || '',
       displayName: user.displayName || '',
-      role: 'teacher',
       updatedAt: serverTimestamp()
-    }, { merge: true });
-  }, [user]);
+    };
+    if (!userProfile?.role) {
+      payload.role = 'teacher';
+    }
+    void setDoc(profileRef, payload, { merge: true });
+  }, [user, userProfile]);
+
+  const handlePromoSubmit = async (code: string) => {
+    setPromoError(null);
+    setPromoBusy(true);
+    try {
+      await authorizeTeacher(code);
+    } catch (err: any) {
+      setPromoError(err?.message || (language === 'sv' ? 'Ogiltig kod.' : 'Invalid code.'));
+    } finally {
+      setPromoBusy(false);
+    }
+  };
+
+  const handleAcceptTos = async () => {
+    setTosBusy(true);
+    try {
+      await acceptTeacherTos(TOS_VERSION);
+    } finally {
+      setTosBusy(false);
+    }
+  };
 
   const handleUpdateAgent = async (updatedAgent: Agent) => {
     if (!user) return;
@@ -201,6 +260,11 @@ const App: React.FC = () => {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err: any) {
+      const code = err?.code || '';
+      if (['auth/popup-blocked', 'auth/popup-closed-by-user', 'auth/cancelled-popup-request'].includes(code)) {
+        await signInWithRedirect(auth, googleProvider);
+        return;
+      }
       setAuthError(err?.message || 'Login failed.');
     }
   };
@@ -255,7 +319,21 @@ const App: React.FC = () => {
                 <button onClick={() => setLanguage('en')} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'en' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500'}`}>EN</button>
               </div>
               {view === 'teacher' && (
-                <button onClick={() => { window.location.hash = ''; }} className="text-[10px] font-black px-5 py-2.5 rounded-xl transition-all uppercase tracking-widest bg-indigo-50 text-indigo-800 border border-indigo-100">{t('teacherPortal')}</button>
+                <div className="flex items-center gap-2">
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setShowAdminPanel(prev => !prev)}
+                      className={`text-[10px] font-black px-3 py-2 rounded-xl uppercase tracking-widest border transition-all ${
+                        showAdminPanel ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-indigo-700 border-indigo-100'
+                      }`}
+                      aria-pressed={showAdminPanel}
+                    >
+                      {t('adminPanel')}
+                    </button>
+                  )}
+                  <button onClick={() => { window.location.hash = ''; }} className="text-[10px] font-black px-5 py-2.5 rounded-xl transition-all uppercase tracking-widest bg-indigo-50 text-indigo-800 border border-indigo-100">{t('teacherPortal')}</button>
+                </div>
               )}
             </div>
           </div>
@@ -266,15 +344,34 @@ const App: React.FC = () => {
       <main className={view === 'student' && isEmbedded ? 'mt-0' : 'mt-8'}>
         {view === 'teacher' ? (
           isLoggedIn && user ? (
-            <TeacherDashboard
-              agents={visibleAgents}
-              currentUserEmail={user.email || ''}
-              currentUserUid={user.uid}
-              submissions={submissions}
-              onCreateAgent={handleCreateAgent}
-              onUpdateAgent={handleUpdateAgent}
-              language={language}
-            />
+            userProfile ? (
+              !userProfile.isAuthorized ? (
+                <PromoCodeGate
+                  language={language}
+                  onSubmit={handlePromoSubmit}
+                  error={promoError}
+                  loading={promoBusy}
+                />
+              ) : (userProfile.hasAcceptedTos && userProfile.tosVersion === TOS_VERSION) ? (
+                <TeacherDashboard
+                  agents={visibleAgents}
+                  currentUserEmail={user.email || ''}
+                  currentUserUid={user.uid}
+                  isAdmin={isAdmin}
+                  showAdminPanel={showAdminPanel}
+                  submissions={submissions}
+                  onCreateAgent={handleCreateAgent}
+                  onUpdateAgent={handleUpdateAgent}
+                  language={language}
+                />
+              ) : (
+                <TeacherTosModal language={language} onLanguageChange={setLanguage} onAccept={handleAcceptTos} loading={tosBusy} />
+              )
+            ) : (
+              <div className="max-w-md mx-auto mt-24 text-center space-y-4 text-slate-400 text-[10px] font-black uppercase tracking-widest">
+                {t('loadingProfile')}
+              </div>
+            )
           ) : (
             <LoginPortal onLogin={handleLogin} language={language} error={authError} />
           )
