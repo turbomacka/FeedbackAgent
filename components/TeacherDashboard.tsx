@@ -157,7 +157,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     taskDescPlaceholder: { sv: 'Beskriv uppgiften och vad eleven ska göra...', en: 'Describe the task and what the student should do...' },
     accessCodeLabel: { sv: 'Accesskod', en: 'Access Code' },
     accessCodePlaceholder: { sv: 'Skriv accesskod...', en: 'Enter access code...' },
-    accessCodeHelp: { sv: 'Krävs för att elever ska låsa upp agenten.', en: 'Required for students to unlock the agent.' },
+    accessCodeHelp: { sv: 'Krävs för att studenter ska låsa upp agenten.', en: 'Required for students to unlock the agent.' },
     accessCodeGenerate: { sv: 'Generera', en: 'Generate' },
     accessCodeRotate: { sv: 'Rulla kod', en: 'Rotate code' },
     accessCodeRequired: { sv: 'Accesskod krävs.', en: 'Access code is required.' },

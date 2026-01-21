@@ -23,6 +23,8 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
   const [accessCodeInput, setAccessCodeInput] = useState('');
   const [accessError, setAccessError] = useState<string | null>(null);
   const [accessBusy, setAccessBusy] = useState(false);
+  const [unlocking, setUnlocking] = useState(false);
+  const accessInputRef = useRef<HTMLInputElement>(null);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const wordCountStatus = useMemo(
     () => validateWordCount(text, agent.wordCountLimit.min, agent.wordCountLimit.max),
@@ -64,9 +66,13 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
     setAccessBusy(true);
     try {
       const { accessToken: token } = await validateAccessCode(agent.id, accessCodeInput.trim());
+      setUnlocking(true);
       sessionStorage.setItem(`accessToken:${agent.id}`, token);
-      setAccessToken(token);
-      setAccessCodeInput('');
+      setTimeout(() => {
+        setAccessToken(token);
+        setAccessCodeInput('');
+        setUnlocking(false);
+      }, 300);
     } catch (err: any) {
       setAccessError(err?.message || (language === 'sv' ? 'Felaktig accesskod.' : 'Invalid access code.'));
     } finally {
@@ -143,46 +149,47 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
 
   const t = (key: keyof typeof translations) => translations[key][language];
 
-  if (!accessToken) {
-    return (
-      <div className="max-w-2xl mx-auto space-y-6 p-4">
-        <header className="text-center space-y-2">
-          <h1 className="text-3xl font-black text-gray-900">{displayTitle}</h1>
-          <p className="text-gray-700 font-medium">{displayDescription}</p>
-        </header>
-        <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-8 space-y-5 text-center">
-          <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
-            <i className="fas fa-lock"></i>
-          </div>
-          <div className="space-y-1">
-            <h2 className="text-lg font-black text-gray-900">{t('accessTitle')}</h2>
-            <p className="text-sm font-semibold text-gray-600">{t('accessInstruction')}</p>
-          </div>
-          <div className="flex flex-col sm:flex-row gap-3 justify-center">
-            <input
-              type="text"
-              value={accessCodeInput}
-              onChange={e => setAccessCodeInput(e.target.value)}
-              placeholder={t('accessPlaceholder')}
-              className="px-5 py-3 rounded-xl border border-gray-200 bg-gray-50 font-black uppercase tracking-widest text-gray-900 text-center placeholder:text-gray-400"
-            />
-            <button
-              type="button"
-              onClick={handleUnlock}
-              disabled={accessBusy}
-              className={`px-6 py-3 rounded-xl font-black uppercase tracking-widest text-xs text-white ${accessBusy ? 'bg-gray-400' : 'bg-indigo-600 hover:bg-indigo-700'}`}
-            >
-              {t('accessUnlock')}
-            </button>
-          </div>
-          {accessError && <p className="text-[11px] font-black text-red-500 uppercase tracking-widest">{accessError}</p>}
-        </div>
-      </div>
-    );
-  }
+  useEffect(() => {
+    if (!accessToken) {
+      setTimeout(() => accessInputRef.current?.focus(), 50);
+    }
+  }, [accessToken]);
 
   return (
-    <div className="max-w-4xl mx-auto space-y-8 p-4">
+    <div className="max-w-4xl mx-auto space-y-8 p-4 relative">
+      {!accessToken && (
+        <div className={`absolute inset-0 z-20 flex items-center justify-center transition-opacity duration-300 ${unlocking ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
+          <div className="absolute inset-0 bg-white/60 backdrop-blur-[10px] rounded-3xl border border-white/60" />
+          <div className="relative z-10 bg-white/90 border border-white/70 shadow-2xl rounded-3xl p-8 w-full max-w-lg text-center">
+            <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
+              <i className="fas fa-lock"></i>
+            </div>
+            <div className="space-y-1 mt-4">
+              <h2 className="text-lg font-black text-gray-900">{t('accessTitle')}</h2>
+              <p className="text-sm font-semibold text-gray-600">{t('accessInstruction')}</p>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-3 justify-center mt-6">
+              <input
+                ref={accessInputRef}
+                type="text"
+                value={accessCodeInput}
+                onChange={e => setAccessCodeInput(e.target.value)}
+                placeholder={t('accessPlaceholder')}
+                className="px-5 py-3 rounded-xl border border-gray-200 bg-gray-50 font-black uppercase tracking-widest text-gray-900 text-center placeholder:text-gray-400"
+              />
+              <button
+                type="button"
+                onClick={handleUnlock}
+                disabled={accessBusy}
+                className={`px-6 py-3 rounded-xl font-black uppercase tracking-widest text-xs text-white ${accessBusy ? 'bg-gray-400' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+              >
+                {t('accessUnlock')}
+              </button>
+            </div>
+            {accessError && <p className="text-[11px] font-black text-red-500 uppercase tracking-widest mt-4">{accessError}</p>}
+          </div>
+        </div>
+      )}
       <header className="text-center space-y-4 relative">
         <div className="absolute left-0 top-0 hidden md:block">
            {results.length > 0 && <span className="bg-indigo-100 text-indigo-800 text-[10px] font-black px-2 py-1 rounded-full uppercase tracking-wider">{results.length} {t('iterations')}</span>}
@@ -195,7 +202,7 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
 
       {error && <div className="bg-red-50 border border-red-200 text-red-700 p-4 rounded-xl font-bold flex items-center gap-3 animate-bounce"><i className="fas fa-exclamation-circle"></i>{error}</div>}
 
-      <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-6 space-y-6">
+      <div className={`bg-white rounded-2xl shadow-xl border border-gray-100 p-6 space-y-6 transition-all ${!accessToken ? 'blur-[10px] pointer-events-none select-none' : ''}`}>
         <textarea
           ref={editorRef}
           className="w-full h-80 p-5 border border-gray-300 rounded-xl outline-none text-gray-950 font-medium leading-relaxed shadow-inner bg-gray-50/50"
@@ -225,7 +232,7 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
       </div>
 
       {results.length > 0 && (
-        <div id="latest-feedback" className="space-y-12 animate-in fade-in slide-in-from-bottom-6 duration-700">
+        <div id="latest-feedback" className={`space-y-12 animate-in fade-in slide-in-from-bottom-6 duration-700 ${!accessToken ? 'blur-[10px] pointer-events-none select-none' : ''}`}>
           <section className="space-y-6">
             <div className="bg-white rounded-2xl shadow-2xl border border-indigo-100 overflow-hidden ring-1 ring-indigo-50">
               <div className="bg-indigo-700 p-5 flex items-center justify-between text-white">
