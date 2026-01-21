@@ -1,9 +1,8 @@
 
 import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { Agent, FeedbackResult } from '../types';
-import { runAssessment, translateContent } from '../services/geminiService';
+import { runAssessment, translateContent, validateAccessCode } from '../services/geminiService';
 import { validateWordCount } from '../utils/security';
-import { EduTooltip } from './EduTooltip';
 
 interface StudentViewProps {
   agent: Agent;
@@ -20,6 +19,10 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
   const sessionSuffix = useMemo(() => Math.floor(1000 + Math.random() * 9000), []);
   const [displayTitle, setDisplayTitle] = useState(agent.name);
   const [displayDescription, setDisplayDescription] = useState(agent.description);
+  const [accessToken, setAccessToken] = useState<string | null>(() => sessionStorage.getItem(`accessToken:${agent.id}`));
+  const [accessCodeInput, setAccessCodeInput] = useState('');
+  const [accessError, setAccessError] = useState<string | null>(null);
+  const [accessBusy, setAccessBusy] = useState(false);
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const wordCountStatus = useMemo(
     () => validateWordCount(text, agent.wordCountLimit.min, agent.wordCountLimit.max),
@@ -29,6 +32,11 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
   const shouldShowSubmissionPrompt = shouldShowVerification && agent.showSubmissionPrompt !== false;
 
   useEffect(() => {
+    if (!accessToken) {
+      setDisplayTitle(agent.name);
+      setDisplayDescription(agent.description);
+      return;
+    }
     const performTranslation = async () => {
       setIsTranslating(true);
       try {
@@ -40,10 +48,38 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
       } finally { setIsTranslating(false); }
     };
     performTranslation();
-  }, [language, agent.name, agent.description]);
+  }, [accessToken, language, agent.name, agent.description]);
+
+  useEffect(() => {
+    const stored = sessionStorage.getItem(`accessToken:${agent.id}`);
+    setAccessToken(stored);
+  }, [agent.id]);
+
+  const handleUnlock = async () => {
+    setAccessError(null);
+    if (!accessCodeInput.trim()) {
+      setAccessError(language === 'sv' ? 'Accesskod krävs.' : 'Access code is required.');
+      return;
+    }
+    setAccessBusy(true);
+    try {
+      const { accessToken: token } = await validateAccessCode(agent.id, accessCodeInput.trim());
+      sessionStorage.setItem(`accessToken:${agent.id}`, token);
+      setAccessToken(token);
+      setAccessCodeInput('');
+    } catch (err: any) {
+      setAccessError(err?.message || (language === 'sv' ? 'Felaktig accesskod.' : 'Invalid access code.'));
+    } finally {
+      setAccessBusy(false);
+    }
+  };
 
   const handleSubmit = async () => {
     setError(null);
+    if (!accessToken) {
+      setError(language === 'sv' ? 'Du behöver en giltig accesskod.' : 'A valid access code is required.');
+      return;
+    }
     const { ok, count } = validateWordCount(text, agent.wordCountLimit.min, agent.wordCountLimit.max);
     if (!ok) {
       setError(language === 'sv' 
@@ -55,7 +91,7 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
 
     setIsProcessing(true);
     try {
-      const { assessment, feedback, verificationCode } = await runAssessment(agent.id, text, language);
+      const { assessment, feedback, verificationCode } = await runAssessment(agent.id, text, language, accessToken);
       const score = assessment.final_metrics.score_100k;
       const newResult: FeedbackResult = {
         studentText: text, pedagogicalFeedback: feedback, assessment, verificationCode, timestamp: Date.now(), language,
@@ -98,10 +134,52 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
     submissionPrompt: {
       sv: 'När du är nöjd – lämna in din senaste version av texten till läraren för bedömning.',
       en: 'When you are satisfied, submit your latest version of the text to your teacher for assessment.'
-    }
+    },
+    accessTitle: { sv: 'Ange accesskod', en: 'Enter access code' },
+    accessInstruction: { sv: 'Ange den accesskod du fått av din lärare för att starta din AI-tutor.', en: 'Enter the access code from your teacher to start your AI tutor.' },
+    accessPlaceholder: { sv: 'Accesskod', en: 'Access code' },
+    accessUnlock: { sv: 'Lås upp', en: 'Unlock' }
   };
 
   const t = (key: keyof typeof translations) => translations[key][language];
+
+  if (!accessToken) {
+    return (
+      <div className="max-w-2xl mx-auto space-y-6 p-4">
+        <header className="text-center space-y-2">
+          <h1 className="text-3xl font-black text-gray-900">{displayTitle}</h1>
+          <p className="text-gray-700 font-medium">{displayDescription}</p>
+        </header>
+        <div className="bg-white rounded-2xl shadow-xl border border-gray-100 p-8 space-y-5 text-center">
+          <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
+            <i className="fas fa-lock"></i>
+          </div>
+          <div className="space-y-1">
+            <h2 className="text-lg font-black text-gray-900">{t('accessTitle')}</h2>
+            <p className="text-sm font-semibold text-gray-600">{t('accessInstruction')}</p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-3 justify-center">
+            <input
+              type="text"
+              value={accessCodeInput}
+              onChange={e => setAccessCodeInput(e.target.value)}
+              placeholder={t('accessPlaceholder')}
+              className="px-5 py-3 rounded-xl border border-gray-200 bg-gray-50 font-black uppercase tracking-widest text-gray-900 text-center placeholder:text-gray-400"
+            />
+            <button
+              type="button"
+              onClick={handleUnlock}
+              disabled={accessBusy}
+              className={`px-6 py-3 rounded-xl font-black uppercase tracking-widest text-xs text-white ${accessBusy ? 'bg-gray-400' : 'bg-indigo-600 hover:bg-indigo-700'}`}
+            >
+              {t('accessUnlock')}
+            </button>
+          </div>
+          {accessError && <p className="text-[11px] font-black text-red-500 uppercase tracking-widest">{accessError}</p>}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="max-w-4xl mx-auto space-y-8 p-4">

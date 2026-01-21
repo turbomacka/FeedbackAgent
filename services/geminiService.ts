@@ -50,7 +50,15 @@ export async function translateContent(
 export async function runAssessment(
   agentId: string,
   studentText: string,
-  language: 'sv' | 'en'
+  language: 'sv' | 'en',
+  accessToken: string
 ): Promise<{ assessment: AssessmentJSON; feedback: string; verificationCode: string }> {
-  return postJson('/assessment', { agentId, studentText, language });
+  return postJson('/assessment', { agentId, studentText, language, accessToken });
+}
+
+export async function validateAccessCode(
+  agentId: string,
+  accessCode: string
+): Promise<{ accessToken: string }> {
+  return postJson('/access/validate', { agentId, accessCode });
 }

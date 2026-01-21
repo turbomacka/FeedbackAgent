@@ -11,6 +11,7 @@ import { Storage } from '@google-cloud/storage';
 import * as aiplatform from '@google-cloud/aiplatform';
 import JSZip from 'jszip';
 import { PDFDocument } from 'pdf-lib';
+import crypto from 'crypto';
 
 admin.initializeApp();
 
@@ -46,6 +47,7 @@ const EMBEDDING_OUTPUT_DIM = Number.parseInt(process.env.EMBEDDING_OUTPUT_DIM ||
 const EMBEDDING_BATCH_SIZE = 100;
 const EMBEDDING_BATCH_TOKEN_LIMIT = 18000;
 const DOC_AI_PAGE_LIMIT = 30;
+const ACCESS_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 
 const db = admin.firestore();
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
@@ -178,8 +180,23 @@ async function logAudit(event: string, details: Record<string, unknown>) {
   });
 }
 
+async function validateAccessToken(agentId: string, accessToken: string) {
+  if (!accessToken) return false;
+  const sessionSnap = await db.collection('accessSessions').doc(accessToken).get();
+  if (!sessionSnap.exists) return false;
+  const data = sessionSnap.data() || {};
+  if (data.agentId !== agentId) return false;
+  const expiresAt = data.expiresAt?.toMillis ? data.expiresAt.toMillis() : data.expiresAt;
+  if (!expiresAt || Date.now() > expiresAt) return false;
+  return true;
+}
+
 function normalizeText(text: string) {
   return text.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeAccessCode(value: string) {
+  return value.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
 }
 
 function decodeEntities(text: string) {
@@ -706,17 +723,64 @@ export const cleanupMaterial = onDocumentDeleted(
   }
 );
 
-apiRouter.post('/assessment', async (req, res) => {
+apiRouter.post('/access/validate', async (req, res) => {
   try {
-    const { agentId, studentText } = req.body || {};
+    const { agentId, accessCode } = req.body || {};
     if (!agentId || typeof agentId !== 'string') {
       return res.status(400).send('Missing agentId.');
+    }
+    if (!accessCode || typeof accessCode !== 'string') {
+      return res.status(400).send('Missing accessCode.');
+    }
+
+    const accessSnap = await db.collection('agentAccess').doc(agentId).get();
+    if (!accessSnap.exists) {
+      return res.status(404).send('Access code not configured.');
+    }
+
+    const storedCode = typeof accessSnap.data()?.code === 'string' ? accessSnap.data()?.code : '';
+    const normalizedInput = normalizeAccessCode(accessCode);
+    if (!storedCode || normalizeAccessCode(storedCode) !== normalizedInput) {
+      return res.status(403).send('Invalid access code.');
+    }
+
+    const token = crypto.randomBytes(24).toString('base64url');
+    const now = Date.now();
+    const expiresAt = admin.firestore.Timestamp.fromMillis(now + ACCESS_SESSION_TTL_MS);
+
+    await db.collection('accessSessions').doc(token).set({
+      agentId,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      expiresAt
+    });
+
+    await logAudit('access_granted', { agentId });
+    return res.json({ accessToken: token });
+  } catch (error: any) {
+    logger.error('Access validation error', error);
+    return res.status(500).send(error.message || 'Failed to validate access.');
+  }
+});
+
+apiRouter.post('/assessment', async (req, res) => {
+  try {
+    const { agentId, studentText, accessToken } = req.body || {};
+    if (!agentId || typeof agentId !== 'string') {
+      return res.status(400).send('Missing agentId.');
+    }
+    if (!accessToken || typeof accessToken !== 'string') {
+      return res.status(403).send('Missing access token.');
     }
     if (!studentText || typeof studentText !== 'string') {
       return res.status(400).send('Missing studentText.');
     }
     if (studentText.length > 20000) {
       return res.status(400).send('Student text is too long.');
+    }
+
+    const accessOk = await validateAccessToken(agentId, accessToken);
+    if (!accessOk) {
+      return res.status(403).send('Invalid or expired access token.');
     }
 
     const agentSnap = await db.collection('agents').doc(agentId).get();

@@ -1,6 +1,6 @@
 
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
-import { collection, deleteDoc, doc, getDocFromServer, getDocs, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
 import { deleteObject, ref, uploadBytes } from 'firebase/storage';
 import { Agent, ReferenceMaterial, Submission, StringencyLevel } from '../types';
 import { db, storage } from '../firebase';
@@ -12,8 +12,8 @@ interface TeacherDashboardProps {
   submissions: Submission[];
   currentUserEmail: string;
   currentUserUid: string;
-  onCreateAgent: (agent: Agent) => void;
-  onUpdateAgent: (agent: Agent) => void;
+  onCreateAgent: (agent: Agent) => Promise<void>;
+  onUpdateAgent: (agent: Agent) => Promise<void>;
   language: 'sv' | 'en';
 }
 
@@ -117,9 +117,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [maxWords, setMaxWords] = useState(600);
   const [passThreshold, setPassThreshold] = useState(80000);
   const [stringency, setStringency] = useState<StringencyLevel>('standard');
+  const [accessCode, setAccessCode] = useState('');
+  const [accessCodeError, setAccessCodeError] = useState<string | null>(null);
+  const [accessCodes, setAccessCodes] = useState<Record<string, string>>({});
   const [showSubmissionPrompt, setShowSubmissionPrompt] = useState(true);
   const [showVerificationCode, setShowVerificationCode] = useState(true);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const [copiedAccessId, setCopiedAccessId] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [draftCreatedId, setDraftCreatedId] = useState<string | null>(null);
 
@@ -151,6 +155,14 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     agentNamePlaceholder: { sv: 'Skriv agentens namn...', en: 'Enter agent name...' },
     taskDesc: { sv: 'Uppgiftsbeskrivning', en: 'Task Description' },
     taskDescPlaceholder: { sv: 'Beskriv uppgiften och vad eleven ska göra...', en: 'Describe the task and what the student should do...' },
+    accessCodeLabel: { sv: 'Accesskod', en: 'Access Code' },
+    accessCodePlaceholder: { sv: 'Skriv accesskod...', en: 'Enter access code...' },
+    accessCodeHelp: { sv: 'Krävs för att elever ska låsa upp agenten.', en: 'Required for students to unlock the agent.' },
+    accessCodeGenerate: { sv: 'Generera', en: 'Generate' },
+    accessCodeRotate: { sv: 'Rulla kod', en: 'Rotate code' },
+    accessCodeRequired: { sv: 'Accesskod krävs.', en: 'Access code is required.' },
+    accessCodeCopied: { sv: 'Kod kopierad!', en: 'Code copied!' },
+    accessCodeBadge: { sv: 'Accesskod', en: 'Access code' },
     criteriaLabel: { sv: 'Bedömningsstöd & Matriser', en: 'Criteria & Matrices' },
     criteriaPlaceholder: { sv: 'Namnge kriterium...', en: 'Name a criterion...' },
     aiMatrix: { sv: 'AI-matris', en: 'AI matrix' },
@@ -192,6 +204,35 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const t = (key: keyof typeof translations) => translations[key][language];
 
+  const normalizeAccessCode = (value: string) =>
+    value.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+  const generateAccessCode = () => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const length = 8;
+    let result = '';
+    for (let i = 0; i < length; i += 1) {
+      result += chars[Math.floor(Math.random() * chars.length)];
+    }
+    return result;
+  };
+
+  const upsertAccessCode = async (agentId: string, code: string) => {
+    const normalized = normalizeAccessCode(code);
+    if (!normalized) return;
+    await setDoc(
+      doc(db, 'agentAccess', agentId),
+      {
+        code: normalized,
+        ownerUid: currentUserUid,
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp()
+      },
+      { merge: true }
+    );
+    setAccessCodes(prev => ({ ...prev, [agentId]: normalized }));
+  };
+
   const resetDraftForm = () => {
     setEditingAgentId(null);
     setDraftCreatedId(null);
@@ -203,6 +244,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setMaxWords(600);
     setPassThreshold(80000);
     setStringency('standard');
+    setAccessCode('');
+    setAccessCodeError(null);
     setShowSubmissionPrompt(true);
     setShowVerificationCode(true);
     setEditingCriterionIdx(null);
@@ -332,12 +375,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setEditingCriterionIdx(null);
     setEditingCriterionValue('');
     setUploadError(null);
+    setAccessCode(accessCodes[agent.id] || '');
+    setAccessCodeError(null);
     setIsModalOpen(true);
+    void (async () => {
+      try {
+        const accessSnap = await getDoc(doc(db, 'agentAccess', agent.id));
+        if (accessSnap.exists()) {
+          const code = accessSnap.data()?.code;
+          if (typeof code === 'string') {
+            setAccessCode(code);
+            setAccessCodes(prev => ({ ...prev, [agent.id]: code }));
+          }
+        }
+      } catch {
+        // Ignore access code fetch failures; teacher can re-save.
+      }
+    })();
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newName || !newDesc || criteriaList.length === 0) return;
+    const normalizedCode = normalizeAccessCode(accessCode);
+    if (!normalizedCode) {
+      setAccessCodeError(t('accessCodeRequired'));
+      return;
+    }
     const agentData: Agent = {
       id: editingAgentId || `agent-${Date.now()}`,
       name: newName, description: newDesc, criteria: criteriaList,
@@ -346,7 +410,12 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       showVerificationCode,
       ownerEmail: currentUserEmail, ownerUid: currentUserUid, sharedWithEmails: [], sharedWithUids: [], visibleTo: [currentUserUid], isPublic: true, isDraft: false
     };
-    if (editingAgentId) onUpdateAgent(agentData); else onCreateAgent(agentData);
+    if (editingAgentId) {
+      await onUpdateAgent(agentData);
+    } else {
+      await onCreateAgent(agentData);
+    }
+    await upsertAccessCode(agentData.id, normalizedCode);
     setDraftCreatedId(null);
     setIsModalOpen(false);
   };
@@ -360,6 +429,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       }
       await deleteDoc(docSnap.ref);
     }
+    await deleteDoc(doc(db, 'agentAccess', agentId));
     await deleteDoc(doc(db, 'agents', agentId));
   };
 
@@ -404,6 +474,22 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     });
     return () => unsubscribe();
   }, [editingAgentId]);
+
+  useEffect(() => {
+    if (agents.length === 0) {
+      setAccessCodes({});
+      return;
+    }
+    const unsubscribers = agents.map(agent =>
+      onSnapshot(doc(db, 'agentAccess', agent.id), (snap) => {
+        const code = snap.exists() ? snap.data()?.code : '';
+        setAccessCodes(prev => ({ ...prev, [agent.id]: typeof code === 'string' ? code : '' }));
+      })
+    );
+    return () => {
+      unsubscribers.forEach(unsub => unsub());
+    };
+  }, [agents]);
 
   const generateStudentUrl = (id: string) => `${window.location.origin}${window.location.pathname}?embed=1#/s/${id}`;
   const generateIframeCode = (id: string) => `<iframe src="${generateStudentUrl(id)}" width="100%" height="800px" style="border:none; border-radius:12px;"></iframe>`;
@@ -468,6 +554,24 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
               <p className="text-[13px] text-slate-500 line-clamp-2 leading-relaxed">{agent.description}</p>
               <div className="flex gap-2">
                 <span className="text-[8px] font-black uppercase tracking-widest px-3 py-1 bg-slate-50 border border-slate-100 rounded-full text-slate-400">{agent.criteria.length} Kriterier</span>
+                {accessCodes[agent.id] ? (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      navigator.clipboard.writeText(accessCodes[agent.id]);
+                      setCopiedAccessId(agent.id);
+                      setTimeout(() => setCopiedAccessId(null), 1500);
+                    }}
+                    className="text-[8px] font-black uppercase tracking-widest px-3 py-1 bg-white border border-slate-100 rounded-full text-slate-700 hover:text-indigo-600"
+                  >
+                    {copiedAccessId === agent.id ? t('accessCodeCopied') : `${t('accessCodeBadge')}: ${accessCodes[agent.id]}`}
+                  </button>
+                ) : (
+                  <span className="text-[8px] font-black uppercase tracking-widest px-3 py-1 bg-slate-50 border border-slate-100 rounded-full text-slate-300">
+                    {t('accessCodeBadge')}: —
+                  </span>
+                )}
               </div>
             </div>
             <div className="px-8 py-5 bg-slate-50/50 border-t border-slate-100 flex items-center justify-between">
@@ -649,6 +753,53 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                       value={newDesc}
                       onChange={e => setNewDesc(e.target.value)}
                     />
+                  </div>
+
+                  <div className="space-y-3">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 flex items-center gap-2">
+                      {t('accessCodeLabel')}
+                      <span className="text-[9px] font-black text-slate-300 uppercase tracking-widest">{t('accessCodeHelp')}</span>
+                    </label>
+                    <div className="flex gap-3 items-center">
+                      <input
+                        required
+                        type="text"
+                        className="flex-1 px-6 py-4 rounded-2xl border border-slate-100 bg-slate-50 font-black text-slate-900 uppercase tracking-widest placeholder:text-slate-300"
+                        placeholder={t('accessCodePlaceholder')}
+                        value={accessCode}
+                        onChange={e => {
+                          setAccessCode(e.target.value);
+                          setAccessCodeError(null);
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const generated = generateAccessCode();
+                          setAccessCode(generated);
+                          setAccessCodeError(null);
+                        }}
+                        className="px-4 py-3 rounded-2xl bg-slate-900 text-white text-[10px] font-black uppercase tracking-widest hover:bg-indigo-600 transition-colors"
+                      >
+                        {t('accessCodeGenerate')}
+                      </button>
+                      {editingAgentId && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const generated = generateAccessCode();
+                            setAccessCode(generated);
+                            setAccessCodeError(null);
+                          }}
+                          className="px-4 py-3 rounded-2xl bg-white border border-slate-200 text-slate-700 text-[10px] font-black uppercase tracking-widest hover:text-indigo-600 transition-colors"
+                        >
+                          {t('accessCodeRotate')}
+                        </button>
+                      )}
+                    </div>
+                    {accessCodeError && (
+                      <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">{accessCodeError}</p>
+                    )}
                   </div>
 
                   <div className="space-y-5">

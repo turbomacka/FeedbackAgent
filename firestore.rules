@@ -13,6 +13,10 @@ service cloud.firestore {
       return signedIn() && resource.data.ownerUid == request.auth.uid;
     }
 
+    function isAgentOwner(agentId) {
+      return signedIn() && get(/databases/$(database)/documents/agents/$(agentId)).data.ownerUid == request.auth.uid;
+    }
+
     match /agents/{agentId} {
       allow read: if resource.data.isPublic == true || canView(resource);
       allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
@@ -22,6 +26,11 @@ service cloud.firestore {
         allow read: if canView(get(/databases/$(database)/documents/agents/$(agentId)));
         allow create, update, delete: if isOwner(get(/databases/$(database)/documents/agents/$(agentId)));
       }
+    }
+
+    match /agentAccess/{agentId} {
+      allow read, update, delete: if isAgentOwner(agentId);
+      allow create: if signedIn() && request.resource.data.ownerUid == request.auth.uid;
     }
 
     match /submissions/{submissionId} {
@@ -38,6 +47,10 @@ service cloud.firestore {
     }
 
     match /ragChunks/{chunkId} {
+      allow read, create, update, delete: if false;
+    }
+
+    match /accessSessions/{sessionId} {
       allow read, create, update, delete: if false;
     }
   }
