@@ -1,0 +1,30 @@
+{
+  "name": "feedback-agent-functions",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "deploy": "firebase deploy --only functions",
+    "serve": "firebase emulators:start --only functions"
+  },
+  "dependencies": {
+    "@google-cloud/aiplatform": "^3.31.0",
+    "@google-cloud/documentai": "^8.0.1",
+    "@google-cloud/storage": "^7.15.2",
+    "@google-cloud/vision": "^5.3.4",
+    "@google/genai": "^1.37.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "feedback-agent": "file:..",
+    "firebase-admin": "^12.3.1",
+    "firebase-functions": "^5.0.1",
+    "jszip": "^3.10.1",
+    "pdf-lib": "^1.17.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,25 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function agentDoc(agentId) {
+      return firestore.get(/databases/(default)/documents/agents/$(agentId));
+    }
+
+    function isOwner(agentId) {
+      return signedIn() && agentDoc(agentId).data.ownerUid == request.auth.uid;
+    }
+
+    function canView(agentId) {
+      return signedIn() && request.auth.uid in agentDoc(agentId).data.visibleTo;
+    }
+
+    match /agents/{agentId}/materials/{materialId}/{filename} {
+      allow read: if canView(agentId);
+      allow write: if isOwner(agentId);
+    }
+  }
+}

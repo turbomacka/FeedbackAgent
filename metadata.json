@@ -1,0 +1,5 @@
+{
+  "name": "Feedback Agent",
+  "description": "An AI-powered formative feedback platform for students and teachers. Uses Gemini to provide pedagogical support and automated grading validation.",
+  "requestFramePermissions": []
+}
