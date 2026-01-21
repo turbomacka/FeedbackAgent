@@ -7,9 +7,10 @@ import { validateWordCount } from '../utils/security';
 interface StudentViewProps {
   agent: Agent;
   language: 'sv' | 'en';
+  onLanguageChange: (lang: 'sv' | 'en') => void;
 }
 
-export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => {
+export const StudentView: React.FC<StudentViewProps> = ({ agent, language, onLanguageChange }) => {
   const [text, setText] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isTranslating, setIsTranslating] = useState(false);
@@ -201,8 +202,8 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
     <div className="max-w-4xl mx-auto space-y-8 p-4 relative">
       {!accessAccepted && (
         <div className={`absolute inset-0 z-20 flex items-center justify-center transition-opacity duration-300 ${unlocking ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
-          <div className="absolute inset-0 bg-white/60 backdrop-blur-[12px] rounded-3xl border border-white/60" />
-          <div className="relative z-10 bg-white/90 border border-white/70 shadow-2xl rounded-3xl p-8 w-full max-w-xl text-left">
+          <div className="absolute inset-0 bg-white/40 backdrop-blur-[12px] rounded-3xl border border-white/50" />
+          <div className="relative z-10 bg-white/85 border border-white/70 shadow-2xl rounded-3xl p-8 w-full max-w-xl text-left">
             <div className="flex items-center gap-3">
               <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center">
                 <i className="fas fa-lock"></i>
@@ -211,6 +212,10 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
                 <h2 className="text-xl font-black text-gray-900">{t('accessTitle')}</h2>
                 <p className="text-sm font-semibold text-gray-600">{t('accessInstruction')}</p>
               </div>
+            </div>
+            <div className="absolute right-6 top-6 flex items-center gap-1 bg-gray-100/80 p-1 rounded-xl border border-gray-200">
+              <button onClick={() => onLanguageChange('sv')} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'sv' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500'}`}>SV</button>
+              <button onClick={() => onLanguageChange('en')} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'en' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500'}`}>EN</button>
             </div>
 
             <div className="flex flex-col sm:flex-row gap-3 mt-6">
@@ -272,6 +277,10 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
         <header className="text-center space-y-4 relative">
           <div className="absolute left-0 top-0 hidden md:block">
              {results.length > 0 && <span className="bg-indigo-100 text-indigo-800 text-[10px] font-black px-2 py-1 rounded-full uppercase tracking-wider">{results.length} {t('iterations')}</span>}
+          </div>
+          <div className="absolute right-0 top-0 hidden md:flex items-center gap-1 bg-gray-100 p-1 rounded-xl border border-gray-200">
+            <button onClick={() => onLanguageChange('sv')} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'sv' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500'}`}>SV</button>
+            <button onClick={() => onLanguageChange('en')} className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'en' ? 'bg-white text-indigo-700 shadow-sm' : 'text-gray-500'}`}>EN</button>
           </div>
           <div className="space-y-2">
             <h1 className={`text-3xl font-black text-gray-900 transition-opacity ${isTranslating ? 'opacity-50' : ''}`}>{displayTitle}</h1>

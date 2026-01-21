@@ -279,7 +279,7 @@ const App: React.FC = () => {
             <LoginPortal onLogin={handleLogin} language={language} error={authError} />
           )
         ) : activeAgent ? (
-          <StudentView agent={activeAgent} language={language} />
+          <StudentView agent={activeAgent} language={language} onLanguageChange={setLanguage} />
         ) : (
           <div className="max-w-md mx-auto mt-24 text-center space-y-4">
             <h2 className="text-2xl font-black text-gray-900 uppercase tracking-tight">{t('notFound')}</h2>
