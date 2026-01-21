@@ -25,6 +25,8 @@ export interface Agent {
   visibleTo: string[];
   isPublic: boolean;
   isDraft?: boolean;
+  showSubmissionPrompt?: boolean;
+  showVerificationCode?: boolean;
 }
 
 export interface AssessmentJSON {

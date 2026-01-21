@@ -47,11 +47,11 @@ const App: React.FC = () => {
       const hash = window.location.hash;
 
       if (hash.startsWith('#/s/')) {
-        const id = hash.replace('#/s/', '');
-        setActiveAgentId(id);
+        const id = hash.replace('#/s/', '').split('?')[0];
+        setActiveAgentId(id || null);
         setView('student');
       } else if (hash.startsWith('#/share/')) {
-        const id = hash.replace('#/share/', '');
+        const id = hash.replace('#/share/', '').split('?')[0];
         if (isLoggedIn && user) {
           const agentRef = doc(db, 'agents', id);
           const updates: Record<string, unknown> = {

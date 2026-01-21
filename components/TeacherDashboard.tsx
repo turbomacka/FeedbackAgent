@@ -5,6 +5,7 @@ import { deleteObject, ref, uploadBytes } from 'firebase/storage';
 import { Agent, ReferenceMaterial, Submission, StringencyLevel } from '../types';
 import { db, storage } from '../firebase';
 import { improveCriterion } from '../services/geminiService';
+import { EduTooltip } from './EduTooltip';
 
 interface TeacherDashboardProps {
   agents: Agent[];
@@ -62,6 +63,44 @@ const EditableMatrix = ({ value, onChange }: { value: string, onChange: (val: st
   );
 };
 
+const InfoPopover = ({ text }: { text: string }) => {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [title, ...bodyParts] = text.split('\n\n');
+  const body = bodyParts.join('\n\n');
+
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (event: MouseEvent) => {
+      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [open]);
+
+  return (
+    <div ref={containerRef} className="relative inline-flex">
+      <button
+        type="button"
+        onClick={() => setOpen(prev => !prev)}
+        className="w-6 h-6 rounded-full border border-slate-200 text-slate-400 hover:text-indigo-600 hover:border-indigo-200 hover:bg-indigo-50 bg-white flex items-center justify-center transition-colors"
+        aria-label="Info"
+        aria-expanded={open}
+      >
+        <i className="fas fa-info text-[10px]"></i>
+      </button>
+      {open && (
+        <div className="absolute z-50 w-80 max-w-[85vw] p-4 text-[12px] leading-relaxed text-slate-700 bg-white/95 backdrop-blur border border-slate-200 rounded-2xl shadow-2xl whitespace-pre-line right-0 mt-2">
+          <div className="text-[11px] font-black text-slate-900 uppercase tracking-widest mb-2">{title}</div>
+          <div className="font-medium text-slate-700">{body || title}</div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, submissions, currentUserEmail, currentUserUid, onCreateAgent, onUpdateAgent, language }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeInsightsId, setActiveInsightsId] = useState<string | null>(null);
@@ -78,6 +117,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [maxWords, setMaxWords] = useState(600);
   const [passThreshold, setPassThreshold] = useState(80000);
   const [stringency, setStringency] = useState<StringencyLevel>('standard');
+  const [showSubmissionPrompt, setShowSubmissionPrompt] = useState(true);
+  const [showVerificationCode, setShowVerificationCode] = useState(true);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [draftCreatedId, setDraftCreatedId] = useState<string | null>(null);
@@ -107,8 +148,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     manageAgent: { sv: 'Mina Agenter', en: 'My Agents' },
     newAgent: { sv: 'Ny Agent', en: 'New Agent' },
     agentName: { sv: 'Agentens Namn', en: 'Agent Name' },
+    agentNamePlaceholder: { sv: 'Skriv agentens namn...', en: 'Enter agent name...' },
     taskDesc: { sv: 'Uppgiftsbeskrivning', en: 'Task Description' },
+    taskDescPlaceholder: { sv: 'Beskriv uppgiften och vad eleven ska göra...', en: 'Describe the task and what the student should do...' },
     criteriaLabel: { sv: 'Bedömningsstöd & Matriser', en: 'Criteria & Matrices' },
+    criteriaPlaceholder: { sv: 'Namnge kriterium...', en: 'Name a criterion...' },
+    aiMatrix: { sv: 'AI-matris', en: 'AI matrix' },
+    aiMatrixHelp: { sv: 'Låt AI skapa en professionell matris med nivåer.', en: 'Let the AI generate a professional matrix with levels.' },
+    ragInfo: {
+      sv: 'Referensmaterial & Kunskapsbas\n\nHär laddar du upp de dokument som ska utgöra din AI-agents hjärna. Med RAG (Retrieval-Augmented Generation) prioriterar agenten information från dessa filer när den ger feedback.\n\nViktiga instruktioner:\n- Upphovsrätt & ansvar: Du ansvarar för att materialet följer upphovsrätt och lokala licensavtal (t.ex. Bonus Copyright Access). Ladda bara upp material du har rätt att dela i undervisningssyfte.\n- Inga personuppgifter: Dokumenten får inte innehålla känsliga personuppgifter, sekretessbelagd information eller opublicerad forskning. All text bearbetas av externa AI-modeller.\n- Format & kvalitet: Bäst är textbaserade PDF:er eller textdokument (.txt, .docx). Undvik skannade bilder utan läsbar text.\n- Pedagogiskt tips: Dela stora böcker i mindre, relevanta kapitel eller artiklar.\n\nHur det fungerar:\nNär en student skriver letar systemet upp relevanta stycken i dina filer och skickar dem som facit till AI-mentorn, vilket minskar risken för gissningar.',
+      en: 'Reference Material & Knowledge Base\n\nUpload the documents that should form your AI agent\'s knowledge base. With RAG (Retrieval-Augmented Generation), the agent prioritizes information from these files when giving feedback.\n\nImportant:\n- Copyright & responsibility: You are responsible for ensuring the material complies with copyright and local licenses. Upload only content you have the right to share for teaching.\n- No personal data: Documents must not contain sensitive personal data, confidential information, or unpublished research. Text is processed by external AI models.\n- Format & quality: Best results with text-based PDFs or text documents (.txt, .docx). Avoid scanned images without readable text.\n- Teaching tip: Split large books into smaller, relevant chapters or articles.\n\nHow it works:\nWhen a student writes, the system retrieves relevant passages and sends them as evidence to the AI mentor, reducing guesswork.'
+    },
     stringencyLabel: { sv: 'Bedömningens Stringens', en: 'Assessment Stringency' },
     refLabel: { sv: 'Referensmaterial (RAG)', en: 'Reference Material' },
     minWords: { sv: 'Min antal ord', en: 'Min Words' },
@@ -122,6 +172,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     copied: { sv: 'Kopierad!', en: 'Copied!' },
     copyEmbed: { sv: 'Kopiera Iframe', en: 'Copy Iframe' },
     embedTitle: { sv: 'LMS-inbäddning', en: 'LMS Embed' },
+    studentPreview: { sv: 'Förhandsvisa studentvy', en: 'Preview student view' },
+    studentPreviewHelp: { sv: 'Öppnar studentvyn i en ny flik.', en: 'Opens the student view in a new tab.' },
     insights: { sv: 'Lärarinsikter', en: 'Teacher Insights' },
     noSubmissions: { sv: 'Inga inlämningar än', en: 'No submissions yet' },
     commonErrors: { sv: 'Vanliga missförstånd', en: 'Common Misunderstandings' },
@@ -130,10 +182,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     results: { sv: 'Resultat & Koder', en: 'Results & Codes' },
     uploadTooLarge: { sv: 'Filen är för stor (max 50 MB).', en: 'File is too large (max 50 MB).' },
     uploadUnsupported: { sv: 'Filtypen stöds inte.', en: 'File type is not supported.' },
-    deleteConfirm: { sv: 'Radera agenten och allt referensmaterial?', en: 'Delete this agent and all reference material?' }
+    deleteConfirm: { sv: 'Radera agenten och allt referensmaterial?', en: 'Delete this agent and all reference material?' },
+    studentOptions: { sv: 'Studentvy', en: 'Student View' },
+    submissionPromptLabel: { sv: 'Visa inlämningsuppmaning', en: 'Show submission prompt' },
+    submissionPromptHelp: { sv: 'Visas tillsammans med verifieringskoden.', en: 'Shown alongside the verification code.' },
+    verificationCodeLabel: { sv: 'Visa verifieringskod', en: 'Show verification code' },
+    verificationCodeHelp: { sv: 'Stäng av om du vill ha enbart formativ återkoppling.', en: 'Turn off for formative-only feedback.' }
   };
 
   const t = (key: keyof typeof translations) => translations[key][language];
+
+  const resetDraftForm = () => {
+    setEditingAgentId(null);
+    setDraftCreatedId(null);
+    setNewName('');
+    setNewDesc('');
+    setCriteriaList([]);
+    setCurrentCriterion('');
+    setMinWords(300);
+    setMaxWords(600);
+    setPassThreshold(80000);
+    setStringency('standard');
+    setShowSubmissionPrompt(true);
+    setShowVerificationCode(true);
+    setEditingCriterionIdx(null);
+    setEditingCriterionValue('');
+    setUploadError(null);
+  };
 
   const ensureDraftAgent = async () => {
     if (editingAgentId) return editingAgentId;
@@ -146,6 +221,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       wordCountLimit: { min: minWords, max: maxWords },
       passThreshold,
       stringency,
+      showSubmissionPrompt,
+      showVerificationCode,
       ownerEmail: currentUserEmail,
       ownerUid: currentUserUid,
       sharedWithEmails: [],
@@ -245,10 +322,16 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setNewName(agent.name);
     setNewDesc(agent.description);
     setCriteriaList(agent.criteria);
+    setCurrentCriterion('');
     setMinWords(agent.wordCountLimit.min);
     setMaxWords(agent.wordCountLimit.max);
     setPassThreshold(agent.passThreshold || 80000);
     setStringency(agent.stringency || 'standard');
+    setShowSubmissionPrompt(agent.showSubmissionPrompt ?? true);
+    setShowVerificationCode(agent.showVerificationCode ?? true);
+    setEditingCriterionIdx(null);
+    setEditingCriterionValue('');
+    setUploadError(null);
     setIsModalOpen(true);
   };
 
@@ -259,6 +342,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       id: editingAgentId || `agent-${Date.now()}`,
       name: newName, description: newDesc, criteria: criteriaList,
       wordCountLimit: { min: minWords, max: maxWords }, passThreshold, stringency,
+      showSubmissionPrompt,
+      showVerificationCode,
       ownerEmail: currentUserEmail, ownerUid: currentUserUid, sharedWithEmails: [], sharedWithUids: [], visibleTo: [currentUserUid], isPublic: true, isDraft: false
     };
     if (editingAgentId) onUpdateAgent(agentData); else onCreateAgent(agentData);
@@ -320,7 +405,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     return () => unsubscribe();
   }, [editingAgentId]);
 
-  const generateIframeCode = (id: string) => `<iframe src="${window.location.origin}${window.location.pathname}#/s/${id}" width="100%" height="800px" style="border:none; border-radius:12px;"></iframe>`;
+  const generateStudentUrl = (id: string) => `${window.location.origin}${window.location.pathname}?embed=1#/s/${id}`;
+  const generateIframeCode = (id: string) => `<iframe src="${generateStudentUrl(id)}" width="100%" height="800px" style="border:none; border-radius:12px;"></iframe>`;
 
   // Filter and aggregate insights for the active agent
   const agentSubmissions = useMemo(() => 
@@ -360,7 +446,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
           <h1 className="text-3xl font-black text-slate-900 tracking-tight">{t('manageAgent')}</h1>
           <p className="text-slate-400 text-[10px] font-black uppercase tracking-widest mt-1">Skapa och redigera dina feedback-assistenter</p>
         </div>
-        <button onClick={() => { setEditingAgentId(null); setDraftCreatedId(null); setIsModalOpen(true); }} className="bg-indigo-600 hover:bg-indigo-700 text-white px-10 py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest shadow-xl">Ny Agent</button>
+        <button
+          onClick={() => {
+            resetDraftForm();
+            setIsModalOpen(true);
+          }}
+          className="bg-indigo-600 hover:bg-indigo-700 text-white px-10 py-4 rounded-2xl font-black text-[11px] uppercase tracking-widest shadow-xl"
+        >
+          Ny Agent
+        </button>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-10">
@@ -381,7 +475,6 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 <i className="fas fa-chart-line"></i> {t('insights')}
               </button>
               <div className="flex gap-4">
-                 <button onClick={(e) => { e.stopPropagation(); openEditModal(agent); }} className="text-slate-300 hover:text-slate-900 transition-colors" aria-label="Edit agent"><i className="fas fa-cog"></i></button>
                  <button onClick={(e) => { e.stopPropagation(); window.location.hash = `/s/${agent.id}`; }} className="text-slate-300 hover:text-slate-900 transition-colors" aria-label="Open agent"><i className="fas fa-external-link-alt"></i></button>
                  <button onClick={(e) => handleDeleteAgent(agent, e)} className="text-slate-300 hover:text-red-600 transition-colors" aria-label="Delete agent"><i className="fas fa-trash"></i></button>
               </div>
@@ -537,11 +630,25 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 <div className="space-y-12">
                   <div className="space-y-4">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('agentName')}</label>
-                    <input required type="text" className="w-full px-8 py-5 rounded-[1.5rem] border border-slate-100 text-xl font-black shadow-inner bg-slate-50 outline-none" value={newName} onChange={e => setNewName(e.target.value)} />
+                    <input
+                      required
+                      type="text"
+                      className="w-full px-8 py-5 rounded-[1.5rem] border border-slate-100 text-xl font-black shadow-inner bg-slate-50 outline-none placeholder:text-slate-300"
+                      placeholder={t('agentNamePlaceholder')}
+                      value={newName}
+                      onChange={e => setNewName(e.target.value)}
+                    />
                   </div>
                   <div className="space-y-4">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('taskDesc')}</label>
-                    <textarea required rows={4} className="w-full px-8 py-5 rounded-[1.5rem] border border-slate-100 text-[15px] font-medium shadow-inner bg-slate-50 outline-none" value={newDesc} onChange={e => setNewDesc(e.target.value)} />
+                    <textarea
+                      required
+                      rows={4}
+                      className="w-full px-8 py-5 rounded-[1.5rem] border border-slate-100 text-[15px] font-medium shadow-inner bg-slate-50 outline-none placeholder:text-slate-300"
+                      placeholder={t('taskDescPlaceholder')}
+                      value={newDesc}
+                      onChange={e => setNewDesc(e.target.value)}
+                    />
                   </div>
 
                   <div className="space-y-5">
@@ -558,11 +665,23 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   <div className="grid grid-cols-2 gap-6">
                     <div className="space-y-2">
                       <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('minWords')}</label>
-                      <input type="number" className="w-full px-6 py-4 rounded-2xl border border-slate-100 bg-slate-50 font-black text-slate-900" value={minWords} onChange={e => setMinWords(Number(e.target.value))} />
+                      <input
+                        type="number"
+                        max={2000}
+                        className="w-full px-6 py-4 rounded-2xl border border-slate-100 bg-slate-50 font-black text-slate-900"
+                        value={minWords}
+                        onChange={e => setMinWords(Math.min(2000, Number(e.target.value)))}
+                      />
                     </div>
                     <div className="space-y-2">
                       <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('maxWords')}</label>
-                      <input type="number" className="w-full px-6 py-4 rounded-2xl border border-slate-100 bg-slate-50 font-black text-slate-900" value={maxWords} onChange={e => setMaxWords(Number(e.target.value))} />
+                      <input
+                        type="number"
+                        max={2000}
+                        className="w-full px-6 py-4 rounded-2xl border border-slate-100 bg-slate-50 font-black text-slate-900"
+                        value={maxWords}
+                        onChange={e => setMaxWords(Math.min(2000, Number(e.target.value)))}
+                      />
                     </div>
                   </div>
 
@@ -574,18 +693,68 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     </div>
                   </div>
 
+                  <div className="space-y-4">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('studentOptions')}</label>
+                    <div className="space-y-3">
+                      <label className="flex items-start gap-4 bg-slate-50 border border-slate-100 rounded-2xl px-6 py-4">
+                        <input
+                          type="checkbox"
+                          className="mt-1 accent-indigo-600"
+                          checked={showVerificationCode}
+                          onChange={(e) => {
+                            const nextValue = e.target.checked;
+                            setShowVerificationCode(nextValue);
+                            if (!nextValue) {
+                              setShowSubmissionPrompt(false);
+                            }
+                          }}
+                        />
+                        <div>
+                          <p className="text-[11px] font-black text-slate-900 uppercase tracking-widest">{t('verificationCodeLabel')}</p>
+                          <p className="text-[11px] font-semibold text-slate-500">{t('verificationCodeHelp')}</p>
+                        </div>
+                      </label>
+                      <label className={`flex items-start gap-4 border rounded-2xl px-6 py-4 ${showVerificationCode ? 'bg-slate-50 border-slate-100' : 'bg-slate-50/40 border-slate-100 opacity-50'}`}>
+                        <input
+                          type="checkbox"
+                          className="mt-1 accent-indigo-600"
+                          checked={showSubmissionPrompt}
+                          onChange={(e) => setShowSubmissionPrompt(e.target.checked)}
+                          disabled={!showVerificationCode}
+                        />
+                        <div>
+                          <p className="text-[11px] font-black text-slate-900 uppercase tracking-widest">{t('submissionPromptLabel')}</p>
+                          <p className="text-[11px] font-semibold text-slate-500">{t('submissionPromptHelp')}</p>
+                        </div>
+                      </label>
+                    </div>
+                  </div>
+
                   {editingAgentId && (
                     <div className="p-8 bg-indigo-50 rounded-[2.5rem] border border-indigo-100 space-y-4">
                       <h3 className="text-[10px] font-black uppercase tracking-widest text-indigo-900 flex items-center gap-2"><i className="fas fa-code"></i> {t('embedTitle')}</h3>
                       <code className="text-[9px] font-mono break-all text-indigo-800 bg-white/50 p-4 rounded-xl block leading-normal border border-indigo-100">{generateIframeCode(editingAgentId)}</code>
                       <button type="button" onClick={() => { navigator.clipboard.writeText(generateIframeCode(editingAgentId)); setCopyStatus('embed'); setTimeout(() => setCopyStatus(null), 2000); }} className="w-full py-3 rounded-xl bg-indigo-900 text-white font-black text-[9px] uppercase tracking-widest">{copyStatus === 'embed' ? t('copied') : t('copyEmbed')}</button>
+                      <div className="pt-2 border-t border-indigo-100/70">
+                        <button
+                          type="button"
+                          onClick={() => window.open(generateStudentUrl(editingAgentId), '_blank', 'noopener,noreferrer')}
+                          className="w-full py-3 rounded-xl bg-white text-indigo-900 font-black text-[9px] uppercase tracking-widest border border-indigo-200 hover:bg-indigo-50 transition-colors"
+                        >
+                          {t('studentPreview')}
+                        </button>
+                        <p className="text-[9px] text-indigo-700 font-semibold mt-2">{t('studentPreviewHelp')}</p>
+                      </div>
                     </div>
                   )}
                 </div>
 
                 <div className="space-y-12">
                   <div className="space-y-5">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('refLabel')}</label>
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1 flex items-center gap-2">
+                      {t('refLabel')}
+                      <InfoPopover text={t('ragInfo')} />
+                    </label>
                     <div className="p-6 bg-slate-50 border-2 border-dashed border-slate-200 rounded-[2rem] text-center space-y-4">
                       <input type="file" multiple id="ref-upload" className="hidden" onChange={handleFileUpload} />
                       <label htmlFor="ref-upload" className="cursor-pointer text-[10px] font-black text-indigo-600 uppercase tracking-widest bg-white px-8 py-3 rounded-xl shadow-sm border border-slate-100 inline-block">Välj filer</label>
@@ -608,7 +777,14 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   <div className="space-y-5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('criteriaLabel')}</label>
                     <div className="flex gap-4">
-                      <input type="text" className="flex-1 px-8 py-4 rounded-[1.5rem] border border-slate-100 text-[12px] font-black outline-none bg-slate-50 uppercase tracking-widest" placeholder="Namnge kriterium..." value={currentCriterion} onChange={e => setCurrentCriterion(e.target.value)} onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), handleAddCriterion())} />
+                      <input
+                        type="text"
+                        className="flex-1 px-8 py-4 rounded-[1.5rem] border border-slate-100 text-[12px] font-black outline-none bg-slate-50 uppercase tracking-widest placeholder:text-slate-300"
+                        placeholder={t('criteriaPlaceholder')}
+                        value={currentCriterion}
+                        onChange={e => setCurrentCriterion(e.target.value)}
+                        onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), handleAddCriterion())}
+                      />
                       <button type="button" onClick={handleAddCriterion} className="w-14 h-14 bg-indigo-600 text-white rounded-2xl shadow-lg flex items-center justify-center"><i className="fas fa-plus"></i></button>
                     </div>
                     <div className="space-y-4 max-h-[400px] overflow-y-auto pr-3 custom-scrollbar">
@@ -624,9 +800,21 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                                 <p className="text-[9px] font-bold text-slate-400 uppercase tracking-tight">{matrix ? 'Professionell matris' : 'Utkast / Text'}</p>
                               </div>
                             </div>
-                            <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+                            <div className="flex gap-2">
                               <button type="button" onClick={() => { setEditingCriterionIdx(idx); setEditingCriterionValue(criteriaList[idx]); }} className="w-8 h-8 rounded-lg bg-white shadow-sm border border-slate-100 text-slate-400 hover:text-indigo-600"><i className="fas fa-pen text-[10px]"></i></button>
-                              {!matrix && <button type="button" disabled={isImproving} onClick={() => handleImproveRequest(idx)} className="w-8 h-8 rounded-lg bg-white shadow-sm border border-slate-100 text-slate-400 hover:text-amber-500"><i className={`fas ${isImproving ? 'fa-spinner fa-spin' : 'fa-sparkles'} text-[10px]`}></i></button>}
+                              {!matrix && (
+                                <EduTooltip text={t('aiMatrixHelp')}>
+                                  <button
+                                    type="button"
+                                    disabled={isImproving}
+                                    onClick={() => handleImproveRequest(idx)}
+                                    className="px-3 h-8 rounded-full bg-amber-50 shadow-sm border border-amber-100 text-amber-700 hover:text-amber-800 hover:bg-amber-100 flex items-center gap-2 disabled:opacity-60"
+                                  >
+                                    <i className={`fas ${isImproving ? 'fa-spinner fa-spin' : 'fa-sparkles'} text-[10px]`}></i>
+                                    <span className="text-[9px] font-black uppercase tracking-widest">{t('aiMatrix')}</span>
+                                  </button>
+                                </EduTooltip>
+                              )}
                               <button type="button" onClick={() => setCriteriaList(prev => prev.filter((_, i) => i !== idx))} className="w-8 h-8 rounded-lg bg-white shadow-sm border border-slate-100 text-slate-400 hover:text-red-500"><i className="fas fa-trash-alt text-[10px]"></i></button>
                             </div>
                           </div>

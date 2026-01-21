@@ -16,10 +16,17 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
   const [isTranslating, setIsTranslating] = useState(false);
   const [results, setResults] = useState<FeedbackResult[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [copyNotice, setCopyNotice] = useState(false);
   const sessionSuffix = useMemo(() => Math.floor(1000 + Math.random() * 9000), []);
   const [displayTitle, setDisplayTitle] = useState(agent.name);
   const [displayDescription, setDisplayDescription] = useState(agent.description);
   const editorRef = useRef<HTMLTextAreaElement>(null);
+  const wordCountStatus = useMemo(
+    () => validateWordCount(text, agent.wordCountLimit.min, agent.wordCountLimit.max),
+    [text, agent.wordCountLimit.min, agent.wordCountLimit.max]
+  );
+  const shouldShowVerification = agent.showVerificationCode !== false;
+  const shouldShowSubmissionPrompt = shouldShowVerification && agent.showSubmissionPrompt !== false;
 
   useEffect(() => {
     const performTranslation = async () => {
@@ -77,6 +84,7 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
     analyzing: { sv: "Analyserar utkast...", en: "Analyzing draft..." },
     resubmit: { sv: 'Skicka in revidering', en: 'Re-submit for Feedback' },
     getFeedback: { sv: 'Hämta AI-återkoppling', en: 'Get AI Feedback' },
+    processingNote: { sv: 'Bearbetar din text... brukar ta 10–30 sek.', en: 'Processing your text... usually 10–30 seconds.' },
     iteration: { sv: 'Iteration', en: 'Iteration' },
     allMet: { sv: 'Samtliga kriterier uppfyllda', en: 'All criteria met' },
     developing: { sv: 'Under utveckling', en: 'Developing' },
@@ -84,7 +92,13 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
     verification: { sv: 'Verifieringskod för Canvas', en: 'Canvas Verification Code' },
     copyHint: { sv: 'Kopiera koden från din bästa iteration.', en: 'Copy the code from your best iteration.' },
     codeCopied: { sv: 'Kod kopierad!', en: 'Code copied!' },
-    placeholder: { sv: 'Börja skriva...', en: 'Start writing...' }
+    placeholder: { sv: 'Börja skriva...', en: 'Start writing...' },
+    wordCount: { sv: 'Ord', en: 'Words' },
+    copyCode: { sv: 'Kopiera kod', en: 'Copy code' },
+    submissionPrompt: {
+      sv: 'När du är nöjd – lämna in din senaste version av texten till läraren för bedömning.',
+      en: 'When you are satisfied, submit your latest version of the text to your teacher for assessment.'
+    }
   };
 
   const t = (key: keyof typeof translations) => translations[key][language];
@@ -109,12 +123,27 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
           className="w-full h-80 p-5 border border-gray-300 rounded-xl outline-none text-gray-950 font-medium leading-relaxed shadow-inner bg-gray-50/50"
           placeholder={t('placeholder')} value={text} onChange={(e) => setText(e.target.value)}
         />
+        <div className="flex items-center justify-between text-[10px] font-black uppercase tracking-widest">
+          <span className="text-slate-400">{t('wordCount')}</span>
+          <span className={`${wordCountStatus.ok ? 'text-emerald-600' : 'text-amber-600'} transition-colors`}>
+            {wordCountStatus.count} / {agent.wordCountLimit.min}-{agent.wordCountLimit.max}
+          </span>
+        </div>
         <button
           onClick={handleSubmit} disabled={isProcessing || !text.trim()}
           className={`w-full py-4 rounded-xl font-black text-white transition-all transform active:scale-[0.99] flex items-center justify-center gap-3 shadow-lg uppercase tracking-widest text-xs ${isProcessing || !text.trim() ? 'bg-gray-400 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'}`}
         >
           {isProcessing ? t('analyzing') : results.length > 0 ? t('resubmit') : t('getFeedback')}
         </button>
+        {isProcessing && (
+          <div className="flex items-center justify-center gap-2 text-[11px] font-semibold text-slate-500">
+            <span className="relative flex h-2 w-2">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-indigo-400 opacity-60"></span>
+              <span className="relative inline-flex rounded-full h-2 w-2 bg-indigo-500"></span>
+            </span>
+            <span>{t('processingNote')}</span>
+          </div>
+        )}
       </div>
 
       {results.length > 0 && (
@@ -140,15 +169,32 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language }) => 
                  <button onClick={() => editorRef.current?.focus()} className="bg-indigo-600 text-white px-8 py-3 rounded-full font-black hover:bg-indigo-700 shadow-lg uppercase tracking-widest text-[10px]">{t('revise')}</button>
               </div>
             </div>
-            <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 flex flex-col md:flex-row items-center justify-between gap-6">
-              <div className="space-y-1 text-center md:text-left">
-                <h3 className="text-emerald-900 font-black flex items-center gap-2 justify-center md:justify-start text-lg uppercase tracking-tight"><i className="fas fa-check-circle"></i>{t('verification')}</h3>
-                <p className="text-emerald-800 text-sm font-bold">{t('copyHint')}</p>
+            {shouldShowVerification && (
+              <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 flex flex-col md:flex-row items-center justify-between gap-6">
+                <div className="space-y-2 text-center md:text-left">
+                  <h3 className="text-emerald-900 font-black flex items-center gap-2 justify-center md:justify-start text-lg uppercase tracking-tight"><i className="fas fa-check-circle"></i>{t('verification')}</h3>
+                  <p className="text-emerald-800 text-sm font-bold">{t('copyHint')}</p>
+                  {shouldShowSubmissionPrompt && (
+                    <p className="text-emerald-900 text-sm font-semibold">{t('submissionPrompt')}</p>
+                  )}
+                </div>
+                <div className="flex flex-col items-center gap-3">
+                  <div className="bg-white px-8 py-4 rounded-xl border-2 border-dashed border-emerald-400 text-3xl font-mono font-black text-emerald-800 select-all shadow-inner">
+                    {latestResult.verificationCode}
+                  </div>
+                  <button
+                    onClick={() => {
+                      navigator.clipboard.writeText(latestResult.verificationCode);
+                      setCopyNotice(true);
+                      setTimeout(() => setCopyNotice(false), 1500);
+                    }}
+                    className="bg-emerald-600 text-white px-6 py-2 rounded-full font-black uppercase tracking-widest text-[10px] hover:bg-emerald-700 transition-colors"
+                  >
+                    {copyNotice ? t('codeCopied') : t('copyCode')}
+                  </button>
+                </div>
               </div>
-              <div className="bg-white px-8 py-4 rounded-xl border-2 border-dashed border-emerald-400 text-3xl font-mono font-black text-emerald-800 select-all cursor-copy hover:border-emerald-600 shadow-inner" onClick={() => { navigator.clipboard.writeText(latestResult.verificationCode); alert(t('codeCopied')); }}>
-                {latestResult.verificationCode}
-              </div>
-            </div>
+            )}
           </section>
         </div>
       )}
