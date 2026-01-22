@@ -1,20 +1,53 @@
 
 /**
  * Generates a purely numeric verification code.
- * Formula: (Score * 10000) + SessionSuffix
- * Score: 0 - 100,000
- * SessionSuffix: 0000 - 9999
- * Resulting code is a number up to 1,000,099,999.
+ * Formula: (Prefix * 1,000,000) + (ScoreBucket * 1,000) + SessionSuffix
+ * Prefix: 200 - 998 (agent-specific)
+ * ScoreBucket: floor(Score / 100), 0 - 999
+ * SessionSuffix: 000 - 999
  */
-export async function generateVerificationCode(score: number, sessionSuffix: number): Promise<string> {
-  // Ensure score is within bounds and rounded
-  const cleanScore = Math.min(100000, Math.max(0, Math.round(score)));
-  // Ensure suffix is exactly 4 digits
-  const cleanSuffix = Math.min(9999, Math.max(0, Math.round(sessionSuffix)));
-  
-  // Calculate the numeric code
-  const numericCode = (cleanScore * 10000) + cleanSuffix;
-  
+const PREFIX_MIN = 200;
+const PREFIX_MAX = 998;
+const SCORE_BUCKET_DIVISOR = 100;
+const SCORE_BUCKET_MULTIPLIER = 1000;
+
+const clampNumber = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, Math.round(value)));
+
+const hashSeed = (seed: string) => {
+  let hash = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash = (hash * 31 + seed.charCodeAt(i)) % 2147483647;
+  }
+  return hash;
+};
+
+export const normalizeVerificationPrefix = (prefix?: number): number | null => {
+  if (typeof prefix !== 'number' || Number.isNaN(prefix)) return null;
+  const rounded = Math.round(prefix);
+  if (rounded < PREFIX_MIN || rounded > PREFIX_MAX) return null;
+  return rounded;
+};
+
+export const generateVerificationPrefix = (seed: string): number => {
+  const range = PREFIX_MAX - PREFIX_MIN + 1;
+  return PREFIX_MIN + (hashSeed(seed) % range);
+};
+
+export const getVerificationMinimum = (prefix: number, passThreshold: number): number => {
+  const cleanPrefix = normalizeVerificationPrefix(prefix) ?? PREFIX_MIN;
+  const bucket = Math.min(999, Math.floor(clampNumber(passThreshold, 0, 100000) / SCORE_BUCKET_DIVISOR));
+  return (cleanPrefix * 1_000_000) + (bucket * SCORE_BUCKET_MULTIPLIER);
+};
+
+export const getVerificationMaximum = (): number => 999_999_999;
+
+export async function generateVerificationCode(score: number, sessionSuffix: number, prefix: number): Promise<string> {
+  const cleanScore = clampNumber(score, 0, 100000);
+  const bucket = Math.min(999, Math.floor(cleanScore / SCORE_BUCKET_DIVISOR));
+  const cleanSuffix = clampNumber(sessionSuffix, 0, 999);
+  const cleanPrefix = normalizeVerificationPrefix(prefix) ?? PREFIX_MIN;
+  const numericCode = (cleanPrefix * 1_000_000) + (bucket * SCORE_BUCKET_MULTIPLIER) + cleanSuffix;
   return numericCode.toString();
 }
 

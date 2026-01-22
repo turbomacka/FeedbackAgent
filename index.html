@@ -11,6 +11,24 @@
       body {
         font-family: 'Inter', sans-serif;
       }
+      .processing-bar {
+        position: relative;
+        overflow: hidden;
+      }
+      .processing-bar::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -40%;
+        width: 40%;
+        height: 100%;
+        background: linear-gradient(90deg, rgba(99,102,241,0.2), rgba(99,102,241,0.8), rgba(99,102,241,0.2));
+        animation: processing-bar 1.2s ease-in-out infinite;
+      }
+      @keyframes processing-bar {
+        0% { transform: translateX(0); }
+        100% { transform: translateX(220%); }
+      }
     </style>
 </head>
 <body class="bg-gray-50 text-gray-900">

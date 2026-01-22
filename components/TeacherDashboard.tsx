@@ -1,12 +1,13 @@
 
 import React, { useState, useMemo, useRef, useCallback, useEffect } from 'react';
-import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
-import { deleteObject, ref, uploadBytes } from 'firebase/storage';
+import { collection, deleteDoc, doc, getDoc, getDocFromServer, getDocs, onSnapshot, setDoc, serverTimestamp, updateDoc } from 'firebase/firestore';
+import { deleteObject, ref, uploadBytesResumable } from 'firebase/storage';
 import { Agent, ReferenceMaterial, Submission, StringencyLevel } from '../types';
-import { db, storage } from '../firebase';
+import { auth, db, storage } from '../firebase';
 import { improveCriterion } from '../services/geminiService';
 import { createPromoCode, disablePromoCode, listPromoCodes, PromoCodeEntry } from '../services/teacherAuthService';
 import { EduTooltip } from './EduTooltip';
+import { generateVerificationPrefix, getVerificationMinimum, getVerificationMaximum } from '../utils/security';
 
 interface TeacherDashboardProps {
   agents: Agent[];
@@ -15,6 +16,7 @@ interface TeacherDashboardProps {
   currentUserUid: string;
   isAdmin: boolean;
   showAdminPanel: boolean;
+  onLanguageChange: (language: 'sv' | 'en') => void;
   onCreateAgent: (agent: Agent) => Promise<void>;
   onUpdateAgent: (agent: Agent) => Promise<void>;
   language: 'sv' | 'en';
@@ -104,7 +106,7 @@ const InfoPopover = ({ text }: { text: string }) => {
   );
 };
 
-export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, submissions, currentUserEmail, currentUserUid, isAdmin, showAdminPanel, onCreateAgent, onUpdateAgent, language }) => {
+export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, submissions, currentUserEmail, currentUserUid, isAdmin, showAdminPanel, onLanguageChange, onCreateAgent, onUpdateAgent, language }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [activeInsightsId, setActiveInsightsId] = useState<string | null>(null);
   const [editingAgentId, setEditingAgentId] = useState<string | null>(null);
@@ -116,12 +118,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [criteriaList, setCriteriaList] = useState<string[]>([]);
   const [currentCriterion, setCurrentCriterion] = useState('');
   const [referenceMaterials, setReferenceMaterials] = useState<ReferenceMaterial[]>([]);
+  const [pendingUploads, setPendingUploads] = useState<{ id: string; name: string; progress: number }[]>([]);
   const [minWords, setMinWords] = useState(300);
   const [maxWords, setMaxWords] = useState(600);
   const [passThreshold, setPassThreshold] = useState(80000);
+  const [verificationPrefix, setVerificationPrefix] = useState<number | null>(null);
   const [stringency, setStringency] = useState<StringencyLevel>('standard');
   const [accessCode, setAccessCode] = useState('');
   const [accessCodeError, setAccessCodeError] = useState<string | null>(null);
+  const [formError, setFormError] = useState<string | null>(null);
   const [accessCodes, setAccessCodes] = useState<Record<string, string>>({});
   const [showSubmissionPrompt, setShowSubmissionPrompt] = useState(true);
   const [showVerificationCode, setShowVerificationCode] = useState(true);
@@ -138,6 +143,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [showLmsInstructions, setShowLmsInstructions] = useState(false);
   const [lmsLanguage, setLmsLanguage] = useState<'sv' | 'en'>('sv');
   const [lmsCopyStatus, setLmsCopyStatus] = useState(false);
+  const [logBusy, setLogBusy] = useState(false);
+  const [logError, setLogError] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [draftCreatedId, setDraftCreatedId] = useState<string | null>(null);
 
@@ -195,9 +202,21 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     promoCopied: { sv: 'Kopierad!', en: 'Copied!' },
     promoEmpty: { sv: 'Inga promo-koder ännu.', en: 'No promo codes yet.' },
     passHelp: {
-      sv: 'Godkänd-gräns\n\nStyr när verifieringskoden räknas som godkänd. Det är inte procent eller betyg utan en intern skala (0–100 000) som matchar bedömningen mot dina kriterier.',
-      en: 'Pass threshold\n\nControls when the verification code counts as passed. It is not a percentage or grade, but an internal 0–100,000 scale that maps to your criteria.'
+      sv: 'Godkänd-gräns\n\nDetta är ingen procent eller betyg, utan en intern skala (0–100 000) som används för att räkna ut lägsta godkända värde i LMS.',
+      en: 'Pass threshold\n\nThis is not a percentage or grade, but an internal 0–100,000 scale used to compute the minimum accepted value in your LMS.'
     },
+    verificationPrefixLabel: { sv: 'Verifieringsprefix (auto)', en: 'Verification prefix (auto)' },
+    verificationPrefixHelp: {
+      sv: 'Prefixet anger lägsta tillåtna kod och är alltid ≥ 200.',
+      en: 'The prefix sets the minimum accepted code and is always ≥ 200.'
+    },
+    lmsIntervalLabel: { sv: 'LMS-intervall', en: 'LMS interval' },
+    lmsIntervalHelp: {
+      sv: 'Ange “Från” som minsta värde. Godkända får ett prefix som är lika med eller högre än min‑prefixet; underkända får ett lägre prefix.',
+      en: 'Use “From” as the minimum value. Passed work gets a prefix at or above the minimum prefix; failed work gets a lower prefix.'
+    },
+    lmsFrom: { sv: 'Från', en: 'From' },
+    lmsTo: { sv: 'Till', en: 'To' },
     manualTooltip: { sv: 'Gör såhär', en: 'How to' },
     manualClose: { sv: 'Stäng', en: 'Close' },
     lmsButton: { sv: 'Instruktioner för LMS', en: 'LMS instructions' },
@@ -233,17 +252,63 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     strengths: { sv: 'Styrkor i gruppen', en: 'Group Strengths' },
     actions: { sv: 'Pedagogiska åtgärder', en: 'Teaching Actions' },
     results: { sv: 'Resultat & Koder', en: 'Results & Codes' },
+    logDownload: { sv: 'Ladda ned logg (anonym)', en: 'Download log (anonymous)' },
+    logCsv: { sv: 'CSV', en: 'CSV' },
+    logJson: { sv: 'JSON', en: 'JSON' },
+    logTxt: { sv: 'TXT', en: 'TXT' },
+    logError: { sv: 'Kunde inte ladda ned logg.', en: 'Failed to download log.' },
+    clearHistory: { sv: 'Rensa studenthistorik', en: 'Clear student history' },
+    clearHistoryHelp: {
+      sv: 'Tar bort tidigare studentinteraktioner så agenten kan användas för en ny grupp.',
+      en: 'Removes past student interactions so the agent can be used for a new group.'
+    },
+    clearHistoryConfirm: {
+      sv: 'Detta rensar all studenthistorik för den här agenten. Det går inte att ångra.',
+      en: 'This clears all student history for this agent. This cannot be undone.'
+    },
+    submissionsAnalyzed: { sv: 'Inlämningar analyserade', en: 'Submissions analyzed' },
+    submissionsLabel: { sv: 'Inlämningar', en: 'Submissions' },
+    stringencyLabel: { sv: 'Stringens', en: 'Stringency' },
+    avgRevisions: { sv: 'Revideringar / session', en: 'Revisions per session' },
+    avgRevisionTime: { sv: 'Tid mellan revideringar', en: 'Time between revisions' },
+    revisionHistogram: { sv: 'Revideringstid (sekunder)', en: 'Revision timing (seconds)' },
+    minutes: { sv: 'min', en: 'min' },
     uploadTooLarge: { sv: 'Filen är för stor (max 50 MB).', en: 'File is too large (max 50 MB).' },
     uploadUnsupported: { sv: 'Filtypen stöds inte.', en: 'File type is not supported.' },
+    uploadTip: {
+      sv: 'Tips: Mindre filer och ren text ger bättre träffsäkerhet. Skannade PDF:er och väldigt långa dokument kan ge sämre återkoppling.',
+      en: 'Tip: Smaller files and clean text improve accuracy. Scanned PDFs and very long documents can reduce feedback quality.'
+    },
+    uploadProgress: { sv: 'Laddar upp', en: 'Uploading' },
+    materialNeedsReviewTitle: {
+      sv: 'Dokumentet är för långt',
+      en: 'Document is too long'
+    },
+    materialNeedsReviewBody: {
+      sv: 'Less is more: det blir bäst om du manuellt väljer ut den viktigaste delen.',
+      en: 'Less is more: best results come from manually selecting the most important parts.'
+    },
+    materialContinue: { sv: 'AI dela upp automatiskt', en: 'Auto-split with AI' },
+    materialAbort: { sv: 'Avbryt och välj delar manuellt', en: 'Cancel and trim manually' },
+    materialTokenLine: { sv: 'Token‑mängd', en: 'Token count' },
+    statusUploaded: { sv: 'Uppladdad', en: 'Uploaded' },
+    statusProcessing: { sv: 'Bearbetar', en: 'Processing' },
+    statusReady: { sv: 'Klar', en: 'Ready' },
+    statusFailed: { sv: 'Misslyckades', en: 'Failed' },
+    statusNeedsReview: { sv: 'Behöver åtgärd', en: 'Needs review' },
+    processingHint: { sv: 'Bearbetar dokumentet…', en: 'Processing document…' },
     deleteConfirm: { sv: 'Radera agenten och allt referensmaterial?', en: 'Delete this agent and all reference material?' },
     studentOptions: { sv: 'Studentvy', en: 'Student View' },
     submissionPromptLabel: { sv: 'Visa inlämningsuppmaning', en: 'Show submission prompt' },
     submissionPromptHelp: { sv: 'Visas tillsammans med verifieringskoden.', en: 'Shown alongside the verification code.' },
     verificationCodeLabel: { sv: 'Visa verifieringskod', en: 'Show verification code' },
-    verificationCodeHelp: { sv: 'Stäng av om du vill ha enbart formativ återkoppling.', en: 'Turn off for formative-only feedback.' }
+    verificationCodeHelp: { sv: 'Stäng av om du vill ha enbart formativ återkoppling.', en: 'Turn off for formative-only feedback.' },
+    criteriaRequired: { sv: 'Lägg till minst ett kriterium för att kunna spara.', en: 'Add at least one criterion to save.' }
   };
 
   const t = (key: keyof typeof translations) => translations[key][language];
+  const lmsMinimum = verificationPrefix ? getVerificationMinimum(verificationPrefix, passThreshold) : null;
+  const lmsMaximum = verificationPrefix ? getVerificationMaximum() : null;
 
   const manualContent = {
     title: {
@@ -285,15 +350,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
           'Här definierar du AI-agentens stringens och hur resultatet ska kommunicera med din lärplattform (t.ex. Canvas).',
           'Stringens: Välj hur strikt AI:n ska vara i sin bedömning. En hög stringens är nödvändig för att motverka att AI:n blir för generös i sin feedback.',
           'Valideringskod för LMS: Systemet genererar en unik kod till studenten efter avslutat arbete.',
-          'Logik: Du ställer in de första 3 siffrorna i koden. Om AI:n bedömer att studentens text når upp till nivån för "Godkänd", genereras en kod med ett numeriskt värde över den tröskel du har definierat. Vid "Underkänt" blir värdet under tröskeln.',
-          'I Canvas: Genom att skapa ett "test" i Canvas som matchar detta tröskelvärde kan du automatisera den summativa översikten och direkt se hur många studenter som uppnått målen.',
+          'Prefix: Systemet skapar ett automatiskt minimiprefix (≥ 200) som ligger till grund för lägsta godkända värde.',
+          'LMS‑minvärde: Sätt “Från” till värdet som visas i panelen. Om LMS kräver intervall, använd “Till” = 999999999.',
+          'I Canvas: Skapa ett “test” som använder minvärdet för automatisk översikt.',
           'Inlämning: Bocka för Inlämningsuppmaning om du vill att studentens slutgiltiga text ska bifogas tillsammans med valideringskoden.'
         ] : [
           'Define the agent’s strictness and how results should connect to your LMS (e.g., Canvas).',
           'Strictness: Choose how strict the AI should be. Higher strictness helps avoid overly generous feedback.',
           'LMS validation code: The system generates a unique code for the student after completion.',
-          'Logic: You set the first 3 digits of the code. If the AI deems the text “Passed,” the numeric value is above your threshold; otherwise it is below.',
-          'In Canvas: Create a “quiz” that matches the threshold to automate the pass overview.',
+          'Prefix: The system creates an automatic minimum prefix (≥ 200) that sets the lowest accepted value.',
+          'LMS minimum: Set “From” to the value shown in the panel. If your LMS requires a range, use “To” = 999999999.',
+          'In Canvas: Create a “quiz” that uses the minimum value for an automatic overview.',
           'Submission: Enable submission prompt if you want the student’s final text attached with the validation code.'
         ]
       },
@@ -369,6 +436,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const normalizeAccessCode = (value: string) =>
     value.replace(/\s+/g, '').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+  const resolveVerificationPrefix = (agentId: string, current?: number | null) => {
+    if (typeof current === 'number' && current >= 200 && current <= 998) {
+      return current;
+    }
+    return generateVerificationPrefix(agentId);
+  };
 
   const generateAccessCode = () => {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -476,9 +550,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setMinWords(300);
     setMaxWords(600);
     setPassThreshold(80000);
+    setVerificationPrefix(null);
     setStringency('standard');
     setAccessCode('');
     setAccessCodeError(null);
+    setFormError(null);
     setShowSubmissionPrompt(true);
     setShowVerificationCode(true);
     setEditingCriterionIdx(null);
@@ -489,6 +565,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const ensureDraftAgent = async () => {
     if (editingAgentId) return editingAgentId;
     const draftRef = doc(collection(db, 'agents'));
+    const prefix = resolveVerificationPrefix(draftRef.id, verificationPrefix);
     const draft: Agent = {
       id: draftRef.id,
       name: newName.trim() || (language === 'sv' ? 'Namnlös agent' : 'Untitled agent'),
@@ -496,6 +573,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       criteria: criteriaList,
       wordCountLimit: { min: minWords, max: maxWords },
       passThreshold,
+      verificationPrefix: prefix,
       stringency,
       showSubmissionPrompt,
       showVerificationCode,
@@ -519,7 +597,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     }
     setEditingAgentId(draftRef.id);
     setDraftCreatedId(draftRef.id);
+    setVerificationPrefix(prefix);
     return draftRef.id;
+  };
+
+  const persistCriteria = async (updatedCriteria: string[]) => {
+    const agentId = await ensureDraftAgent();
+    if (!agentId) return;
+    await updateDoc(doc(db, 'agents', agentId), {
+      criteria: updatedCriteria,
+      updatedAt: serverTimestamp()
+    });
   };
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -543,8 +631,26 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       const storagePath = `agents/${agentId}/materials/${materialRef.id}/${file.name}`;
       const storageRef = ref(storage, storagePath);
 
+      setPendingUploads(prev => [...prev, { id: materialRef.id, name: file.name, progress: 0 }]);
       try {
-        await uploadBytes(storageRef, file, { contentType: file.type || 'application/octet-stream' });
+        await new Promise<void>((resolve, reject) => {
+          const task = uploadBytesResumable(storageRef, file, { contentType: file.type || 'application/octet-stream' });
+          task.on(
+            'state_changed',
+            (snapshot) => {
+              const progress = snapshot.totalBytes
+                ? Math.round((snapshot.bytesTransferred / snapshot.totalBytes) * 100)
+                : 0;
+              setPendingUploads(prev =>
+                prev.map(item => item.id === materialRef.id ? { ...item, progress } : item)
+              );
+            },
+            (error) => reject(error),
+            () => resolve()
+          );
+        });
+
+        setPendingUploads(prev => prev.filter(item => item.id !== materialRef.id));
         await setDoc(materialRef, {
           name: file.name,
           mimeType: file.type || 'application/octet-stream',
@@ -554,6 +660,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
           createdAt: serverTimestamp()
         });
       } catch (error: any) {
+        setPendingUploads(prev => prev.filter(item => item.id !== materialRef.id));
         setUploadError(error?.message || 'Upload failed. Try again.');
       }
     }
@@ -567,6 +674,27 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     }
   };
 
+  const handleContinueMaterial = async (material: ReferenceMaterial) => {
+    if (!editingAgentId) return;
+    await updateDoc(doc(db, 'agents', editingAgentId, 'materials', material.id), {
+      status: 'uploaded',
+      forceTrim: true,
+      reprocessRequested: true,
+      error: '',
+      errorCode: '',
+      updatedAt: serverTimestamp()
+    });
+  };
+
+  const handleAbortMaterial = async (material: ReferenceMaterial) => {
+    if (!editingAgentId) return;
+    await updateDoc(doc(db, 'agents', editingAgentId, 'materials', material.id), {
+      status: 'failed',
+      error: language === 'sv' ? 'Avbrutet av lärare.' : 'Cancelled by teacher.',
+      updatedAt: serverTimestamp()
+    });
+  };
+
   const handleImproveRequest = async (idx: number) => {
     const criterion = criteriaList[idx];
     if (!criterion || isImproving) return;
@@ -578,6 +706,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       const upd = [...criteriaList];
       upd[idx] = res;
       setCriteriaList(upd);
+      await persistCriteria(upd);
     } catch(e: any) {
       alert(e.message || "Kunde inte förbättra kriteriet.");
     } finally {
@@ -585,10 +714,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     }
   };
 
-  const handleAddCriterion = () => {
+  const handleAddCriterion = async () => {
     if (currentCriterion.trim()) {
-      setCriteriaList(prev => [...prev, currentCriterion.trim()]);
+      const updated = [...criteriaList, currentCriterion.trim()];
+      setCriteriaList(updated);
       setCurrentCriterion('');
+      setFormError(null);
+      await persistCriteria(updated);
     }
   };
 
@@ -602,12 +734,14 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setMinWords(agent.wordCountLimit.min);
     setMaxWords(agent.wordCountLimit.max);
     setPassThreshold(agent.passThreshold || 80000);
+    setVerificationPrefix(resolveVerificationPrefix(agent.id, agent.verificationPrefix));
     setStringency(agent.stringency || 'standard');
     setShowSubmissionPrompt(agent.showSubmissionPrompt ?? true);
     setShowVerificationCode(agent.showVerificationCode ?? true);
     setEditingCriterionIdx(null);
     setEditingCriterionValue('');
     setUploadError(null);
+    setFormError(null);
     setAccessCode(accessCodes[agent.id] || '');
     setAccessCodeError(null);
     setIsModalOpen(true);
@@ -629,16 +763,24 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newName || !newDesc || criteriaList.length === 0) return;
+    setFormError(null);
+    if (!newName || !newDesc || criteriaList.length === 0) {
+      if (criteriaList.length === 0) {
+        setFormError(t('criteriaRequired'));
+      }
+      return;
+    }
     const normalizedCode = normalizeAccessCode(accessCode);
     if (!normalizedCode) {
       setAccessCodeError(t('accessCodeRequired'));
       return;
     }
+    const agentId = editingAgentId || `agent-${Date.now()}`;
+    const resolvedPrefix = resolveVerificationPrefix(agentId, verificationPrefix);
     const agentData: Agent = {
-      id: editingAgentId || `agent-${Date.now()}`,
+      id: agentId,
       name: newName, description: newDesc, criteria: criteriaList,
-      wordCountLimit: { min: minWords, max: maxWords }, passThreshold, stringency,
+      wordCountLimit: { min: minWords, max: maxWords }, passThreshold, verificationPrefix: resolvedPrefix, stringency,
       showSubmissionPrompt,
       showVerificationCode,
       ownerEmail: currentUserEmail, ownerUid: currentUserUid, sharedWithEmails: [], sharedWithUids: [], visibleTo: [currentUserUid], isPublic: true, isDraft: false
@@ -694,9 +836,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   useEffect(() => {
     if (!editingAgentId) {
       setReferenceMaterials([]);
+      setPendingUploads([]);
       setUploadError(null);
       return;
     }
+    setPendingUploads([]);
     const materialsRef = collection(db, 'agents', editingAgentId, 'materials');
     const unsubscribe = onSnapshot(materialsRef, (snapshot) => {
       const materials = snapshot.docs.map(docSnap => ({
@@ -726,6 +870,23 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const generateStudentUrl = (id: string) => `${window.location.origin}${window.location.pathname}?embed=1#/s/${id}`;
   const generateIframeCode = (id: string) => `<iframe src="${generateStudentUrl(id)}" width="100%" height="800px" style="border:none; border-radius:12px;"></iframe>`;
+  const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
+  const statusLabel = (status: ReferenceMaterial['status']) => {
+    switch (status) {
+      case 'uploaded':
+        return t('statusUploaded');
+      case 'processing':
+        return t('statusProcessing');
+      case 'ready':
+        return t('statusReady');
+      case 'failed':
+        return t('statusFailed');
+      case 'needs_review':
+        return t('statusNeedsReview');
+      default:
+        return status;
+    }
+  };
 
   // Filter and aggregate insights for the active agent
   const agentSubmissions = useMemo(() => 
@@ -738,25 +899,121 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     const errors = new Set<string>();
     const strengths = new Set<string>();
     const actions = new Set<string>();
-    let totalScore = 0;
 
     agentSubmissions.forEach(s => {
       s.insights.common_errors.forEach(e => errors.add(e));
       s.insights.strengths.forEach(st => strengths.add(st));
       s.insights.teaching_actions.forEach(a => actions.add(a));
-      totalScore += s.score;
     });
 
     return {
       errors: Array.from(errors).slice(0, 5),
       strengths: Array.from(strengths).slice(0, 5),
       actions: Array.from(actions).slice(0, 5),
-      avgScore: Math.round(totalScore / agentSubmissions.length),
       count: agentSubmissions.length
     };
   }, [agentSubmissions]);
 
+  const revisionStats = useMemo(() => {
+    const sessions = new Map<string, Submission[]>();
+    for (const submission of agentSubmissions) {
+      if (!submission.sessionId) continue;
+      const list = sessions.get(submission.sessionId) || [];
+      list.push(submission);
+      sessions.set(submission.sessionId, list);
+    }
+
+    const buckets = [
+      { label: '0–20', min: 0, max: 20, count: 0 },
+      { label: '21–60', min: 20, max: 60, count: 0 },
+      { label: '61–120', min: 60, max: 120, count: 0 },
+      { label: '120–240', min: 120, max: 240, count: 0 },
+      { label: '240+', min: 240, max: Infinity, count: 0 }
+    ];
+
+    let totalRevisions = 0;
+    let totalDelta = 0;
+    let deltaCount = 0;
+
+    for (const list of sessions.values()) {
+      if (list.length === 0) continue;
+      const sorted = [...list].sort((a, b) => a.timestamp - b.timestamp);
+      if (sorted.length > 1) {
+        totalRevisions += sorted.length - 1;
+      }
+      for (let i = 1; i < sorted.length; i += 1) {
+        const deltaSeconds = Math.max(0, (sorted[i].timestamp - sorted[i - 1].timestamp) / 1000);
+        const deltaMinutes = deltaSeconds / 60;
+        totalDelta += deltaMinutes;
+        deltaCount += 1;
+        const bucket = buckets.find(b => deltaSeconds >= b.min && deltaSeconds < b.max);
+        if (bucket) bucket.count += 1;
+      }
+    }
+
+    return {
+      sessionCount: sessions.size,
+      avgRevisionsPerSession: sessions.size ? totalRevisions / sessions.size : 0,
+      avgMinutesBetween: deltaCount ? totalDelta / deltaCount : 0,
+      buckets
+    };
+  }, [agentSubmissions]);
+
   const activeAgent = agents.find(a => a.id === activeInsightsId);
+
+  const handleDownloadLog = async (format: 'csv' | 'json' | 'txt') => {
+    if (!activeInsightsId) return;
+    setLogError(null);
+    setLogBusy(true);
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) throw new Error('Not authenticated.');
+      const params = new URLSearchParams({ agentId: activeInsightsId, format });
+      const response = await fetch(`${API_BASE}/teacher/logs/export?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `feedback-log-${activeInsightsId}.${format}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err: any) {
+      setLogError(err?.message || t('logError'));
+    } finally {
+      setLogBusy(false);
+    }
+  };
+
+  const handleClearHistory = async () => {
+    if (!activeInsightsId) return;
+    const confirmed = window.confirm(t('clearHistoryConfirm'));
+    if (!confirmed) return;
+    setLogError(null);
+    setLogBusy(true);
+    try {
+      const token = await auth.currentUser?.getIdToken();
+      if (!token) throw new Error('Not authenticated.');
+      const params = new URLSearchParams({ agentId: activeInsightsId });
+      const response = await fetch(`${API_BASE}/teacher/logs/clear?${params.toString()}`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+    } catch (err: any) {
+      setLogError(err?.message || t('logError'));
+    } finally {
+      setLogBusy(false);
+    }
+  };
 
   return (
     <div className="max-w-6xl mx-auto p-4 space-y-12">
@@ -1077,10 +1334,30 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                    </div>
                    <div>
                       <h2 className="text-2xl font-black text-slate-900 tracking-tight uppercase">{activeAgent.name} - {t('insights')}</h2>
-                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">{agentSubmissions.length} Inlämningar analyserade</p>
+                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.2em]">
+                        {agentSubmissions.length} {t('submissionsAnalyzed')}
+                      </p>
                    </div>
                 </div>
-                <button onClick={() => setActiveInsightsId(null)} className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"><i className="fas fa-times text-xl"></i></button>
+                <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => onLanguageChange('sv')}
+                      className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'sv' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                    >
+                      SV
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onLanguageChange('en')}
+                      className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest ${language === 'en' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500'}`}
+                    >
+                      EN
+                    </button>
+                  </div>
+                  <button onClick={() => setActiveInsightsId(null)} className="w-12 h-12 rounded-full bg-slate-50 text-slate-400 hover:text-slate-900 transition-all flex items-center justify-center"><i className="fas fa-times text-xl"></i></button>
+                </div>
               </div>
 
               <div className="flex-1 overflow-y-auto p-12 custom-scrollbar bg-slate-50/50">
@@ -1092,28 +1369,56 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 ) : (
                   <div className="space-y-12">
                     {/* Statistik Header */}
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-8">
-                       <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm">
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-2">Snittresultat</span>
-                          <div className="flex items-baseline gap-2">
-                             <span className="text-4xl font-black text-indigo-600">{(aggregatedInsights.avgScore / 1000).toFixed(1)}k</span>
-                             <span className="text-slate-400 text-sm font-bold">/ 100k</span>
-                          </div>
-                          <div className="mt-4 w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
-                             <div className="h-full bg-indigo-600 transition-all duration-1000" style={{width: `${aggregatedInsights.avgScore / 1000}%`}}></div>
-                          </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-8">
+                       <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col justify-center">
+                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">{t('avgRevisions')}</span>
+                          <span className="text-4xl font-black text-indigo-600">
+                            {revisionStats.sessionCount ? revisionStats.avgRevisionsPerSession.toFixed(1) : '—'}
+                          </span>
                        </div>
                        <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col justify-center">
-                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Inlämningar</span>
+                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">{t('avgRevisionTime')}</span>
+                          <span className="text-4xl font-black text-slate-900">
+                            {revisionStats.avgMinutesBetween ? `${Math.round(revisionStats.avgMinutesBetween)} ${t('minutes')}` : '—'}
+                          </span>
+                       </div>
+                       <div className="bg-white p-8 rounded-[2.5rem] border border-slate-100 shadow-sm flex flex-col justify-center">
+                          <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">{t('submissionsLabel')}</span>
                           <span className="text-4xl font-black text-slate-900">{aggregatedInsights.count}</span>
                        </div>
                        <div className="bg-indigo-600 p-8 rounded-[2.5rem] shadow-xl shadow-indigo-100 flex flex-col justify-center">
-                          <span className="text-[9px] font-black text-indigo-200 uppercase tracking-widest block mb-1">Stringens</span>
-                          <span className="text-4xl font-black text-white uppercase tracking-tight">{activeAgent.stringency}</span>
+                          <span className="text-[9px] font-black text-indigo-200 uppercase tracking-widest block mb-1">{t('stringencyLabel')}</span>
+                          <span className="text-4xl font-black text-white uppercase tracking-tight">
+                            {activeAgent.stringency === 'strict' ? t('str') : activeAgent.stringency === 'generous' ? t('gen') : t('std')}
+                          </span>
                        </div>
                     </div>
 
                     {/* Analys Kolumner */}
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-3 ml-2">
+                        <i className="fas fa-clock text-indigo-500 text-xs"></i>
+                        <h3 className="text-[10px] font-black text-slate-900 uppercase tracking-widest">{t('revisionHistogram')}</h3>
+                      </div>
+                      <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm">
+                        <div className="space-y-3">
+                          {revisionStats.buckets.map((bucket) => {
+                            const maxCount = Math.max(...revisionStats.buckets.map(b => b.count), 1);
+                            const width = `${Math.round((bucket.count / maxCount) * 100)}%`;
+                            return (
+                              <div key={bucket.label} className="flex items-center gap-3">
+                                <div className="w-16 text-[9px] font-black text-slate-500 uppercase tracking-widest">{bucket.label}</div>
+                                <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
+                                  <div className="h-full bg-indigo-500" style={{ width }} />
+                                </div>
+                                <div className="w-10 text-right text-[9px] font-black text-slate-400">{bucket.count}</div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    </div>
+
                     <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
                       <div className="space-y-6">
                         <div className="flex items-center gap-3 ml-2">
@@ -1152,32 +1457,62 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                       </div>
                     </div>
 
-                    {/* Verifieringskoder Tabell */}
-                    <div className="space-y-6">
-                       <h3 className="text-[10px] font-black text-slate-900 uppercase tracking-widest ml-2">{t('results')}</h3>
-                       <div className="bg-white rounded-[2.5rem] border border-slate-100 overflow-hidden shadow-sm">
-                          <table className="w-full text-left">
-                             <thead>
-                                <tr className="bg-slate-50 text-[10px] font-black text-slate-400 uppercase tracking-widest border-b border-slate-100">
-                                   <th className="px-8 py-5">Tid</th>
-                                   <th className="px-8 py-5">Verifieringskod</th>
-                                   <th className="px-8 py-5 text-right">Resultat</th>
-                                </tr>
-                             </thead>
-                             <tbody className="divide-y divide-slate-100">
-                                {agentSubmissions.map((s, i) => (
-                                   <tr key={i} className="hover:bg-slate-50 transition-colors">
-                                      <td className="px-8 py-5 text-[11px] font-bold text-slate-400">{new Date(s.timestamp).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}</td>
-                                      <td className="px-8 py-5">
-                                         <code className="bg-slate-100 text-slate-900 px-3 py-1 rounded-lg font-black text-sm">{s.verificationCode}</code>
-                                      </td>
-                                      <td className="px-8 py-5 text-right font-black text-indigo-600">{(s.score / 1000).toFixed(1)}k</td>
-                                   </tr>
-                                ))}
-                             </tbody>
-                          </table>
-                       </div>
+                    <div className="space-y-4">
+                      <div className="flex items-center gap-3 ml-2">
+                        <i className="fas fa-download text-indigo-500 text-xs"></i>
+                        <h3 className="text-[10px] font-black text-slate-900 uppercase tracking-widest">{t('logDownload')}</h3>
+                      </div>
+                      <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm space-y-4">
+                        <div className="flex flex-wrap gap-3">
+                          <button
+                            type="button"
+                            disabled={logBusy}
+                            onClick={() => handleDownloadLog('csv')}
+                            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest ${
+                              logBusy ? 'bg-slate-200 text-slate-400' : 'bg-indigo-600 text-white hover:bg-indigo-700'
+                            }`}
+                          >
+                            {t('logCsv')}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={logBusy}
+                            onClick={() => handleDownloadLog('json')}
+                            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest ${
+                              logBusy ? 'bg-slate-200 text-slate-400' : 'bg-white border border-slate-200 text-slate-700 hover:text-indigo-600'
+                            }`}
+                          >
+                            {t('logJson')}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={logBusy}
+                            onClick={() => handleDownloadLog('txt')}
+                            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest ${
+                              logBusy ? 'bg-slate-200 text-slate-400' : 'bg-white border border-slate-200 text-slate-700 hover:text-indigo-600'
+                            }`}
+                          >
+                            {t('logTxt')}
+                          </button>
+                        </div>
+                        <div className="pt-2 border-t border-slate-100/80">
+                          <button
+                            type="button"
+                            disabled={logBusy}
+                            onClick={handleClearHistory}
+                            className={`px-4 py-2 rounded-xl text-[9px] font-black uppercase tracking-widest ${
+                              logBusy ? 'bg-slate-200 text-slate-400' : 'bg-rose-500 text-white hover:bg-rose-600'
+                            }`}
+                          >
+                            {t('clearHistory')}
+                          </button>
+                          <p className="text-[9px] text-slate-500 font-semibold mt-2">{t('clearHistoryHelp')}</p>
+                        </div>
+                        {logError && <p className="text-[9px] font-black uppercase tracking-widest text-red-500">{logError}</p>}
+                      </div>
                     </div>
+
+                    {/* Results table removed by request */}
                   </div>
                 )}
               </div>
@@ -1198,7 +1533,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 <div className="flex-1 p-10 overflow-y-auto"><div className="max-w-[1200px] mx-auto"><EditableMatrix value={editingCriterionValue} onChange={setEditingCriterionValue} language={language} /></div></div>
                 <div className="p-10 border-t border-slate-100 bg-white flex gap-6 justify-end">
                   <button onClick={() => setEditingCriterionIdx(null)} className="px-10 py-4 font-black text-slate-400 text-[11px] uppercase tracking-widest">Avbryt</button>
-                  <button onClick={() => { const updated = [...criteriaList]; updated[editingCriterionIdx!] = editingCriterionValue.trim(); setCriteriaList(updated); setEditingCriterionIdx(null); }} className="px-14 py-4 rounded-2xl font-black text-white bg-indigo-600 text-[11px] uppercase tracking-widest">Spara matris</button>
+                  <button onClick={() => { const updated = [...criteriaList]; updated[editingCriterionIdx!] = editingCriterionValue.trim(); setCriteriaList(updated); setEditingCriterionIdx(null); void persistCriteria(updated); }} className="px-14 py-4 rounded-2xl font-black text-white bg-indigo-600 text-[11px] uppercase tracking-widest">Spara matris</button>
                 </div>
               </div>
             )}
@@ -1289,19 +1624,6 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                       >
                         {t('accessCodeGenerate')}
                       </button>
-                      {editingAgentId && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            const generated = generateAccessCode();
-                            setAccessCode(generated);
-                            setAccessCodeError(null);
-                          }}
-                          className="px-4 py-3 rounded-2xl bg-white border border-slate-200 text-slate-700 text-[10px] font-black uppercase tracking-widest hover:text-indigo-600 transition-colors"
-                        >
-                          {t('accessCodeRotate')}
-                        </button>
-                      )}
                     </div>
                     {accessCodeError && (
                       <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">{accessCodeError}</p>
@@ -1343,17 +1665,6 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   </div>
 
                   <div className="space-y-4">
-                    <div className="flex items-center gap-2 ml-1">
-                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">{t('passLabel')}</label>
-                      <InfoPopover text={t('passHelp')} />
-                    </div>
-                    <div className="flex items-center gap-6">
-                      <input type="range" min="0" max="100000" step="5000" className="flex-1 accent-indigo-600" value={passThreshold} onChange={e => setPassThreshold(Number(e.target.value))} />
-                      <span className="text-xl font-black text-indigo-600 w-20 text-right">{(passThreshold/1000).toFixed(0)}k</span>
-                    </div>
-                  </div>
-
-                  <div className="space-y-4">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">{t('studentOptions')}</label>
                     <div className="space-y-3">
                       <label className="flex items-start gap-4 bg-slate-50 border border-slate-100 rounded-2xl px-6 py-4">
@@ -1374,6 +1685,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                           <p className="text-[11px] font-semibold text-slate-500">{t('verificationCodeHelp')}</p>
                         </div>
                       </label>
+                      {showVerificationCode && verificationPrefix && lmsMinimum !== null && lmsMaximum !== null && (
+                        <div className="ml-4 bg-slate-50 border border-slate-100 rounded-2xl p-5 space-y-4">
+                          <div className="flex items-center gap-4">
+                            <div className="px-4 py-2 rounded-xl bg-slate-900 text-white text-sm font-black tracking-widest">
+                              {verificationPrefix}
+                            </div>
+                            <div>
+                              <p className="text-[10px] font-black uppercase tracking-widest text-slate-700">{t('verificationPrefixLabel')}</p>
+                              <p className="text-[11px] font-semibold text-slate-500">{t('verificationPrefixHelp')}</p>
+                            </div>
+                          </div>
+                          <div className="space-y-2">
+                            <p className="text-[10px] font-black uppercase tracking-widest text-slate-700">{t('lmsIntervalLabel')}</p>
+                            <div className="grid grid-cols-2 gap-4">
+                              <div className="bg-white border border-slate-100 rounded-xl px-4 py-3">
+                                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">{t('lmsFrom')}</p>
+                                <p className="text-sm font-black text-slate-900">{lmsMinimum}</p>
+                              </div>
+                              <div className="bg-white border border-slate-100 rounded-xl px-4 py-3">
+                                <p className="text-[9px] font-black uppercase tracking-widest text-slate-400">{t('lmsTo')}</p>
+                                <p className="text-sm font-black text-slate-900">{lmsMaximum}</p>
+                              </div>
+                            </div>
+                            <p className="text-[11px] font-semibold text-slate-500">{t('lmsIntervalHelp')}</p>
+                          </div>
+                        </div>
+                      )}
                       <label className={`flex items-start gap-4 border rounded-2xl px-6 py-4 ${showVerificationCode ? 'bg-slate-50 border-slate-100' : 'bg-slate-50/40 border-slate-100 opacity-50'}`}>
                         <input
                           type="checkbox"
@@ -1418,16 +1756,69 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     <div className="p-6 bg-slate-50 border-2 border-dashed border-slate-200 rounded-[2rem] text-center space-y-4">
                       <input type="file" multiple id="ref-upload" className="hidden" onChange={handleFileUpload} />
                       <label htmlFor="ref-upload" className="cursor-pointer text-[10px] font-black text-indigo-600 uppercase tracking-widest bg-white px-8 py-3 rounded-xl shadow-sm border border-slate-100 inline-block">Välj filer</label>
+                      <p className="text-[10px] font-semibold text-slate-400">{t('uploadTip')}</p>
                       {uploadError && <p className="text-[9px] font-black text-red-500 uppercase tracking-widest">{uploadError}</p>}
-                      <div className="flex flex-wrap gap-2 justify-center">
+                      <div className="flex flex-wrap gap-3 justify-center">
+                        {pendingUploads.map((upload) => (
+                          <div key={upload.id} className="bg-white px-4 py-3 rounded-2xl border border-slate-200 flex flex-col gap-2 min-w-[220px]">
+                            <div className="flex items-center gap-3">
+                              <i className="fas fa-cloud-upload-alt text-indigo-500 text-[10px]"></i>
+                              <span className="text-[9px] font-black text-slate-700 max-w-[120px] truncate">{upload.name}</span>
+                              <span className="ml-auto text-[8px] font-black uppercase tracking-widest text-indigo-600">
+                                {t('uploadProgress')} {upload.progress}%
+                              </span>
+                            </div>
+                            <div className="w-full h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                              <div
+                                className="h-full bg-indigo-500 transition-all duration-300"
+                                style={{ width: `${upload.progress}%` }}
+                              />
+                            </div>
+                          </div>
+                        ))}
                         {referenceMaterials.map((ref) => (
-                          <div key={ref.id} className="bg-white px-4 py-2 rounded-full border border-slate-200 flex items-center gap-3">
-                            <i className="fas fa-file-pdf text-red-500 text-[10px]"></i>
-                            <span className="text-[9px] font-black text-slate-700 max-w-[120px] truncate">{ref.name}</span>
-                            <span className={`text-[8px] font-black uppercase tracking-widest ${ref.status === 'ready' ? 'text-emerald-600' : ref.status === 'failed' ? 'text-red-500' : 'text-amber-500'}`}>
-                              {ref.status}
-                            </span>
-                            <button type="button" onClick={() => handleRemoveMaterial(ref)} className="text-slate-300 hover:text-red-500"><i className="fas fa-times text-[10px]"></i></button>
+                          <div key={ref.id} className="bg-white px-4 py-3 rounded-2xl border border-slate-200 flex flex-col gap-2 min-w-[220px]">
+                            <div className="flex items-center gap-3">
+                              <i className="fas fa-file-pdf text-red-500 text-[10px]"></i>
+                              <span className="text-[9px] font-black text-slate-700 max-w-[120px] truncate">{ref.name}</span>
+                              <span className={`ml-auto text-[8px] font-black uppercase tracking-widest ${ref.status === 'ready' ? 'text-emerald-600' : ref.status === 'failed' ? 'text-red-500' : ref.status === 'needs_review' ? 'text-amber-600' : 'text-amber-500'}`}>
+                                {statusLabel(ref.status)}
+                              </span>
+                              <button type="button" onClick={() => handleRemoveMaterial(ref)} className="text-slate-300 hover:text-red-500"><i className="fas fa-times text-[10px]"></i></button>
+                            </div>
+                            {(ref.status === 'uploaded' || ref.status === 'processing') && (
+                              <div className="space-y-2">
+                                <div className="w-full h-1.5 bg-slate-100 rounded-full processing-bar" />
+                                <p className="text-[9px] font-semibold text-slate-400">{t('processingHint')}</p>
+                              </div>
+                            )}
+                            {ref.status === 'needs_review' && (
+                              <div className="text-[9px] text-slate-500 font-semibold space-y-2">
+                                <p className="font-black text-amber-700 uppercase tracking-widest">{t('materialNeedsReviewTitle')}</p>
+                                <p>{t('materialNeedsReviewBody')}</p>
+                                {(ref.tokenCount || ref.tokenLimit) && (
+                                  <p className="text-[9px] text-slate-400">
+                                    {t('materialTokenLine')}: {ref.tokenCount ?? '—'} / {ref.tokenLimit ?? '—'}
+                                  </p>
+                                )}
+                                <div className="flex gap-2 pt-1">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleContinueMaterial(ref)}
+                                    className="px-3 py-2 rounded-xl bg-slate-200 text-slate-700 font-black text-[8px] uppercase tracking-widest hover:bg-slate-300"
+                                  >
+                                    {t('materialContinue')}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleAbortMaterial(ref)}
+                                    className="px-3 py-2 rounded-xl bg-emerald-500 text-white font-black text-[8px] uppercase tracking-widest hover:bg-emerald-600"
+                                  >
+                                    {t('materialAbort')}
+                                  </button>
+                                </div>
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -1443,7 +1834,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                         placeholder={t('criteriaPlaceholder')}
                         value={currentCriterion}
                         onChange={e => setCurrentCriterion(e.target.value)}
-                        onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), handleAddCriterion())}
+                        onKeyDown={e => e.key === 'Enter' && (e.preventDefault(), void handleAddCriterion())}
                       />
                       <button type="button" onClick={handleAddCriterion} className="w-14 h-14 bg-indigo-600 text-white rounded-2xl shadow-lg flex items-center justify-center"><i className="fas fa-plus"></i></button>
                     </div>
@@ -1475,12 +1866,25 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                                   </button>
                                 </EduTooltip>
                               )}
-                              <button type="button" onClick={() => setCriteriaList(prev => prev.filter((_, i) => i !== idx))} className="w-8 h-8 rounded-lg bg-white shadow-sm border border-slate-100 text-slate-400 hover:text-red-500"><i className="fas fa-trash-alt text-[10px]"></i></button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const updated = criteriaList.filter((_, i) => i !== idx);
+                                  setCriteriaList(updated);
+                                  void persistCriteria(updated);
+                                }}
+                                className="w-8 h-8 rounded-lg bg-white shadow-sm border border-slate-100 text-slate-400 hover:text-red-500"
+                              >
+                                <i className="fas fa-trash-alt text-[10px]"></i>
+                              </button>
                             </div>
                           </div>
                         );
                       })}
                     </div>
+                    {formError && (
+                      <p className="text-[10px] font-black text-red-500 uppercase tracking-widest">{formError}</p>
+                    )}
                   </div>
                 </div>
               </div>

@@ -82,6 +82,7 @@ const EMBEDDING_TASK_TYPE = process.env.EMBEDDING_TASK_TYPE || '';
 const EMBEDDING_OUTPUT_DIM = Number.parseInt(process.env.EMBEDDING_OUTPUT_DIM || '', 10);
 const EMBEDDING_BATCH_SIZE = 100;
 const EMBEDDING_BATCH_TOKEN_LIMIT = 18000;
+const TRIM_TOKEN_BUDGET = 9000;
 const DOC_AI_PAGE_LIMIT = 30;
 const ACCESS_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const TOS_VERSION = 'v1-2026-01';
@@ -189,12 +190,53 @@ const RTF_MIME_TYPES = new Set(['application/rtf']);
 const MAX_PREVIEW_CHARS = 20000;
 const CHUNK_SIZE = 1200;
 const CHUNK_OVERLAP = 200;
-function generateVerificationCode(score, sessionSuffix) {
-    const cleanScore = Math.min(100000, Math.max(0, Math.round(score)));
-    const cleanSuffix = Math.min(9999, Math.max(0, Math.round(sessionSuffix)));
-    const numericCode = (cleanScore * 10000) + cleanSuffix;
+const PREFIX_MIN = 200;
+const PREFIX_MAX = 998;
+const SCORE_BUCKET_DIVISOR = 100;
+const SCORE_BUCKET_MULTIPLIER = 1000;
+const clampNumber = (value, min, max) => Math.min(max, Math.max(min, Math.round(value)));
+const hashSeed = (seed) => {
+    let hash = 0;
+    for (let i = 0; i < seed.length; i += 1) {
+        hash = (hash * 31 + seed.charCodeAt(i)) % 2147483647;
+    }
+    return hash;
+};
+const normalizeVerificationPrefix = (prefix) => {
+    if (typeof prefix !== 'number' || Number.isNaN(prefix))
+        return null;
+    const rounded = Math.round(prefix);
+    if (rounded < PREFIX_MIN || rounded > PREFIX_MAX)
+        return null;
+    return rounded;
+};
+const generateVerificationPrefix = (seed) => {
+    const range = PREFIX_MAX - PREFIX_MIN + 1;
+    return PREFIX_MIN + (hashSeed(seed) % range);
+};
+function generateVerificationCode(score, sessionSuffix, prefix) {
+    const cleanScore = clampNumber(score, 0, 100000);
+    const bucket = Math.min(999, Math.floor(cleanScore / SCORE_BUCKET_DIVISOR));
+    const cleanSuffix = clampNumber(sessionSuffix, 0, 999);
+    const cleanPrefix = normalizeVerificationPrefix(prefix) ?? PREFIX_MIN;
+    const numericCode = (cleanPrefix * 1000000) + (bucket * SCORE_BUCKET_MULTIPLIER) + cleanSuffix;
     return numericCode.toString();
 }
+const getScoreBucket = (score) => Math.min(999, Math.floor(clampNumber(score, 0, 100000) / SCORE_BUCKET_DIVISOR));
+const randomPrefixInRange = (minPrefix) => {
+    const minValue = Math.min(PREFIX_MAX, Math.max(PREFIX_MIN, minPrefix));
+    const range = PREFIX_MAX - minValue + 1;
+    return minValue + Math.floor(Math.random() * range);
+};
+const randomPrefixBelow = (minPrefix) => {
+    const minValue = Math.min(PREFIX_MAX, Math.max(PREFIX_MIN, minPrefix));
+    if (minValue <= PREFIX_MIN) {
+        return PREFIX_MIN;
+    }
+    const maxValue = minValue - 1;
+    const range = maxValue - PREFIX_MIN + 1;
+    return PREFIX_MIN + Math.floor(Math.random() * range);
+};
 async function logAudit(event, details) {
     await db.collection('auditLogs').add({
         event,
@@ -396,6 +438,18 @@ function chunkText(text, chunkSize = CHUNK_SIZE, overlap = CHUNK_OVERLAP) {
     }
     return chunks;
 }
+function limitChunksByTokenBudget(chunks, budget) {
+    const limited = [];
+    let total = 0;
+    for (const chunk of chunks) {
+        const tokens = estimateTokens(chunk);
+        if (total + tokens > budget)
+            break;
+        limited.push(chunk);
+        total += tokens;
+    }
+    return limited;
+}
 function dedupeRepeated(value) {
     if (value.length % 2 !== 0)
         return value;
@@ -439,7 +493,7 @@ function extractEmbeddingValues(prediction) {
     return [];
 }
 function estimateTokens(text) {
-    return Math.max(1, Math.ceil(text.length / 4));
+    return Math.max(1, Math.ceil(text.length / 3));
 }
 async function embedTexts(texts) {
     const endpoint = buildEmbeddingEndpoint(EMBEDDING_MODEL);
@@ -500,6 +554,16 @@ async function embedTexts(texts) {
         }
         catch (error) {
             const message = error?.message || 'Request contains an invalid argument.';
+            if (/input token count/i.test(message) && /supports up to/i.test(message)) {
+                const match = message.match(/input token count is (\d+).*supports up to (\d+)/i);
+                const tokenCount = match ? Number(match[1]) : undefined;
+                const tokenLimit = match ? Number(match[2]) : undefined;
+                const tokenError = new Error(message);
+                tokenError.code = 'TOKEN_LIMIT';
+                tokenError.tokenCount = tokenCount;
+                tokenError.tokenLimit = tokenLimit;
+                throw tokenError;
+            }
             throw new Error(`Vertex AI embedding failed. Details: ${message}. Endpoint: ${endpoint}`);
         }
     }
@@ -622,22 +686,35 @@ ${text}
         return fallbackReferenceContext(agentId);
     }
 }
-exports.processMaterial = (0, firestore_1.onDocumentCreated)({
+exports.processMaterial = (0, firestore_1.onDocumentWritten)({
     document: 'agents/{agentId}/materials/{materialId}',
     region: REGION,
     secrets: FUNCTION_SECRETS,
     memory: '2GiB',
     timeoutSeconds: 540
 }, async (event) => {
-    const snapshot = event.data;
+    const snapshot = event.data?.after;
+    const beforeSnapshot = event.data?.before;
     if (!snapshot)
         return;
     const { agentId, materialId } = event.params;
     const material = snapshot.data();
     if (!material)
         return;
-    if (material.status === 'processing' || material.status === 'ready') {
+    const currentStatus = material.status || 'uploaded';
+    const previousStatus = beforeSnapshot?.exists ? beforeSnapshot.data()?.status : null;
+    const reprocessRequested = material.reprocessRequested === true;
+    if (currentStatus === 'processing' || currentStatus === 'ready') {
         return;
+    }
+    if (currentStatus !== 'uploaded') {
+        return;
+    }
+    if (previousStatus === 'uploaded' && !reprocessRequested) {
+        return;
+    }
+    if (reprocessRequested) {
+        await snapshot.ref.set({ reprocessRequested: admin.firestore.FieldValue.delete() }, { merge: true });
     }
     if (!material.gcsPath) {
         await snapshot.ref.update({
@@ -682,21 +759,47 @@ exports.processMaterial = (0, firestore_1.onDocumentCreated)({
             return;
         }
         await clearChunks(materialId);
-        const vectors = await embedTexts(chunks);
-        await writeChunks(agentId, materialId, chunks);
-        if (vectors.length === chunks.length) {
+        const totalTokenEstimate = chunks.reduce((sum, chunk) => sum + estimateTokens(chunk), 0);
+        const trimmedChunks = material.forceTrim
+            ? limitChunksByTokenBudget(chunks, TRIM_TOKEN_BUDGET)
+            : chunks;
+        if (material.forceTrim && trimmedChunks.length === 0) {
+            await snapshot.ref.update({
+                status: 'failed',
+                error: 'Trimmed content is empty.',
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return;
+        }
+        const vectors = await embedTexts(trimmedChunks);
+        await writeChunks(agentId, materialId, trimmedChunks);
+        if (vectors.length === trimmedChunks.length) {
             await upsertDatapoints(agentId, materialId, vectors);
         }
         await snapshot.ref.update({
             status: 'ready',
             extractedText: normalized.slice(0, MAX_PREVIEW_CHARS),
-            chunkCount: chunks.length,
+            chunkCount: trimmedChunks.length,
+            originalChunkCount: chunks.length,
+            tokenEstimate: totalTokenEstimate,
+            trimmed: material.forceTrim === true,
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         });
-        await logAudit('material_processed', { agentId, materialId, chunkCount: chunks.length });
+        await logAudit('material_processed', { agentId, materialId, chunkCount: trimmedChunks.length });
     }
     catch (error) {
         logger.error('Material processing failed', error);
+        if (error?.code === 'TOKEN_LIMIT') {
+            await snapshot.ref.update({
+                status: 'needs_review',
+                errorCode: 'TOKEN_LIMIT',
+                error: error.message || 'Token limit exceeded.',
+                tokenCount: error.tokenCount || null,
+                tokenLimit: error.tokenLimit || null,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+            return;
+        }
         await snapshot.ref.update({
             status: 'failed',
             error: error.message || 'Processing failed.',
@@ -964,6 +1067,136 @@ apiRouter.post('/teacher/accept-tos', async (req, res) => {
         return res.status(500).send(error.message || 'Failed to accept TOS.');
     }
 });
+apiRouter.get('/teacher/logs/export', async (req, res) => {
+    try {
+        const authUser = await requireAuth(req, res);
+        if (!authUser)
+            return;
+        const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : '';
+        if (!agentId) {
+            return res.status(400).send('Missing agentId.');
+        }
+        const format = typeof req.query.format === 'string' ? req.query.format.toLowerCase() : 'csv';
+        const from = req.query.from ? Number(req.query.from) : undefined;
+        const to = req.query.to ? Number(req.query.to) : undefined;
+        const agentSnap = await db.collection('agents').doc(agentId).get();
+        if (!agentSnap.exists) {
+            return res.status(404).send('Agent not found.');
+        }
+        const agent = agentSnap.data() || {};
+        const visibleTo = Array.isArray(agent.visibleTo) ? agent.visibleTo : [];
+        if (agent.ownerUid !== authUser.uid && !visibleTo.includes(authUser.uid)) {
+            return res.status(403).send('Not authorized.');
+        }
+        let query = db.collection('submissions').where('agentId', '==', agentId);
+        if (Number.isFinite(from)) {
+            query = query.where('timestamp', '>=', from);
+        }
+        if (Number.isFinite(to)) {
+            query = query.where('timestamp', '<=', to);
+        }
+        const snapshot = await query.get();
+        const rows = snapshot.docs.map(docSnap => docSnap.data());
+        rows.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        if (format === 'json') {
+            const records = rows.map((row) => ({
+                timestamp: row.timestamp || 0,
+                session_id: row.sessionId || '',
+                score_100k: row.score || 0,
+                stringency: row.stringency || '',
+                common_errors: row.insights?.common_errors || [],
+                strengths: row.insights?.strengths || [],
+                teaching_actions: row.insights?.teaching_actions || []
+            }));
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="feedback-log-${agentId}.json"`);
+            return res.send(JSON.stringify({ agentId, count: records.length, records }, null, 2));
+        }
+        if (format === 'txt') {
+            const lines = [];
+            lines.push(`agent_id: ${agentId}`);
+            lines.push(`records: ${rows.length}`);
+            lines.push('');
+            for (const row of rows) {
+                lines.push(`timestamp: ${row.timestamp || 0}`);
+                lines.push(`session_id: ${row.sessionId || ''}`);
+                lines.push(`score_100k: ${row.score || 0}`);
+                lines.push(`stringency: ${row.stringency || ''}`);
+                lines.push(`common_errors: ${(row.insights?.common_errors || []).join(' | ')}`);
+                lines.push(`strengths: ${(row.insights?.strengths || []).join(' | ')}`);
+                lines.push(`teaching_actions: ${(row.insights?.teaching_actions || []).join(' | ')}`);
+                lines.push('---');
+            }
+            res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+            res.setHeader('Content-Disposition', `attachment; filename="feedback-log-${agentId}.txt"`);
+            return res.send(lines.join('\n'));
+        }
+        const header = ['timestamp', 'session_id', 'score_100k', 'stringency', 'common_errors', 'strengths', 'teaching_actions'];
+        const lines = [header.join(',')];
+        for (const row of rows) {
+            const values = [
+                row.timestamp || 0,
+                row.sessionId || '',
+                row.score || 0,
+                row.stringency || '',
+                (row.insights?.common_errors || []).join(' | '),
+                (row.insights?.strengths || []).join(' | '),
+                (row.insights?.teaching_actions || []).join(' | ')
+            ].map((value) => {
+                const str = String(value ?? '');
+                return `"${str.replace(/"/g, '""')}"`;
+            });
+            lines.push(values.join(','));
+        }
+        const csv = lines.join('\n');
+        res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+        res.setHeader('Content-Disposition', `attachment; filename="feedback-log-${agentId}.csv"`);
+        return res.send(csv);
+    }
+    catch (error) {
+        logger.error('Log export error', error);
+        return res.status(500).send(error.message || 'Failed to export logs.');
+    }
+});
+apiRouter.post('/teacher/logs/clear', async (req, res) => {
+    try {
+        const authUser = await requireAuth(req, res);
+        if (!authUser)
+            return;
+        const agentId = typeof req.query.agentId === 'string' ? req.query.agentId : '';
+        if (!agentId) {
+            return res.status(400).send('Missing agentId.');
+        }
+        const agentSnap = await db.collection('agents').doc(agentId).get();
+        if (!agentSnap.exists) {
+            return res.status(404).send('Agent not found.');
+        }
+        const agent = agentSnap.data() || {};
+        const visibleTo = Array.isArray(agent.visibleTo) ? agent.visibleTo : [];
+        if (agent.ownerUid !== authUser.uid && !visibleTo.includes(authUser.uid)) {
+            return res.status(403).send('Not authorized.');
+        }
+        const submissionsSnap = await db.collection('submissions').where('agentId', '==', agentId).get();
+        if (submissionsSnap.empty) {
+            return res.json({ ok: true, deleted: 0 });
+        }
+        let deleted = 0;
+        for (let i = 0; i < submissionsSnap.docs.length; i += 400) {
+            const batch = db.batch();
+            submissionsSnap.docs.slice(i, i + 400).forEach(docSnap => {
+                batch.delete(docSnap.ref);
+            });
+            await batch.commit();
+            deleted += Math.min(400, submissionsSnap.docs.length - i);
+        }
+        await logAudit('log_cleared', { agentId, deleted });
+        return res.json({ ok: true, deleted });
+    }
+    catch (error) {
+        logger.error('Log clear error', error);
+        return res.status(500).send(error.message || 'Failed to clear logs.');
+    }
+});
 apiRouter.post('/assessment', async (req, res) => {
     try {
         const { agentId, studentText, accessToken } = req.body || {};
@@ -983,7 +1216,8 @@ apiRouter.post('/assessment', async (req, res) => {
         if (!session || !session.data?.acceptedAt) {
             return res.status(403).send('Invalid or expired access token.');
         }
-        const agentSnap = await db.collection('agents').doc(agentId).get();
+        const agentRef = db.collection('agents').doc(agentId);
+        const agentSnap = await agentRef.get();
         if (!agentSnap.exists) {
             return res.status(404).send('Agent not found.');
         }
@@ -1060,15 +1294,27 @@ apiRouter.post('/assessment', async (req, res) => {
             },
             config: { systemInstruction: PROMPT_A_SYSTEM }
         });
+        let minPrefix = normalizeVerificationPrefix(agent.verificationPrefix);
+        if (!minPrefix) {
+            minPrefix = generateVerificationPrefix(agentId);
+            await agentRef.set({ verificationPrefix: minPrefix }, { merge: true });
+        }
         const score = assessment?.final_metrics?.score_100k || 0;
-        const sessionSuffix = Math.floor(1000 + Math.random() * 9000);
-        const verificationCode = generateVerificationCode(score, sessionSuffix);
+        const passThreshold = typeof agent.passThreshold === 'number' ? agent.passThreshold : 80000;
+        const passBucket = getScoreBucket(passThreshold);
+        const scoreBucket = getScoreBucket(score);
+        const isPassed = scoreBucket >= passBucket;
+        const codePrefix = isPassed ? randomPrefixInRange(minPrefix) : randomPrefixBelow(minPrefix);
+        const sessionSuffix = Math.floor(Math.random() * 1000);
+        const verificationCode = generateVerificationCode(score, sessionSuffix, codePrefix);
         const visibleTo = Array.isArray(agent.visibleTo) ? agent.visibleTo : [agent.ownerUid].filter(Boolean);
+        const sessionId = crypto_1.default.createHash('sha256').update(accessToken).digest('hex').slice(0, 16);
         await db.collection('submissions').add({
             agentId,
             verificationCode,
             score,
             timestamp: Date.now(),
+            sessionId,
             stringency,
             insights: assessment.teacher_insights || { common_errors: [], strengths: [], teaching_actions: [] },
             visibleTo

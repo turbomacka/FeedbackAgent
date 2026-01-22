@@ -213,6 +213,9 @@ const App: React.FC = () => {
     const isDraft = typeof updatedAgent.isDraft === 'boolean'
       ? updatedAgent.isDraft
       : (typeof existing?.isDraft === 'boolean' ? existing.isDraft : false);
+    const verificationPrefix = typeof updatedAgent.verificationPrefix === 'number'
+      ? updatedAgent.verificationPrefix
+      : existing?.verificationPrefix;
 
     const payload = {
       name: updatedAgent.name,
@@ -220,6 +223,7 @@ const App: React.FC = () => {
       criteria: updatedAgent.criteria,
       wordCountLimit: updatedAgent.wordCountLimit,
       passThreshold: updatedAgent.passThreshold,
+      verificationPrefix,
       stringency: updatedAgent.stringency,
       ownerEmail: existing?.ownerEmail || user.email || '',
       ownerUid: existing?.ownerUid || user.uid,
@@ -241,6 +245,7 @@ const App: React.FC = () => {
       criteria: newAgent.criteria,
       wordCountLimit: newAgent.wordCountLimit,
       passThreshold: newAgent.passThreshold,
+      verificationPrefix: newAgent.verificationPrefix,
       stringency: newAgent.stringency,
       ownerEmail: user.email || '',
       ownerUid: user.uid,
@@ -359,6 +364,7 @@ const App: React.FC = () => {
                   currentUserUid={user.uid}
                   isAdmin={isAdmin}
                   showAdminPanel={showAdminPanel}
+                  onLanguageChange={setLanguage}
                   submissions={submissions}
                   onCreateAgent={handleCreateAgent}
                   onUpdateAgent={handleUpdateAgent}

@@ -4,8 +4,13 @@ export interface ReferenceMaterial {
   name: string;
   mimeType: string;
   size: number;
-  status: 'uploaded' | 'processing' | 'ready' | 'failed';
+  status: 'uploaded' | 'processing' | 'ready' | 'failed' | 'needs_review';
   gcsPath?: string;
+  error?: string;
+  errorCode?: string;
+  tokenCount?: number;
+  tokenLimit?: number;
+  forceTrim?: boolean;
 }
 
 export type StringencyLevel = 'generous' | 'standard' | 'strict';
@@ -17,6 +22,7 @@ export interface Agent {
   criteria: string[];
   wordCountLimit: { min: number; max: number };
   passThreshold: number; 
+  verificationPrefix?: number;
   stringency: StringencyLevel;
   ownerEmail: string; // E-post till skaparen
   ownerUid: string;
@@ -65,6 +71,7 @@ export interface Submission {
   verificationCode: string;
   score: number;
   timestamp: number;
+  sessionId?: string;
   stringency: StringencyLevel; 
   visibleTo: string[];
   insights: {
