@@ -1,5 +1,5 @@
 
-import { AssessmentJSON } from "../types";
+import { AssessmentJSON, CriterionMatrixItem } from "../types";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api';
 
@@ -31,19 +31,36 @@ export async function improveCriterion(
   return data.text;
 }
 
+export async function analyzeCriterion(
+  payload: {
+    agentId: string;
+    name: string;
+    description: string;
+    indicator: string;
+    bloom_level: string;
+    bloom_index: number;
+    weight: number;
+    taskDescription?: string;
+  }
+): Promise<Omit<CriterionMatrixItem, 'id'>> {
+  return postJson('/criterion/analyze', payload);
+}
+
 export async function translateContent(
   name: string,
   description: string,
-  targetLang: 'sv' | 'en'
-): Promise<{ name: string; description: string }> {
+  targetLang: 'sv' | 'en',
+  indicator?: string
+): Promise<{ name: string; description: string; indicator?: string }> {
   try {
-    return await postJson<{ name: string; description: string }>('/translate', {
+    return await postJson<{ name: string; description: string; indicator?: string }>('/translate', {
       name,
       description,
+      indicator,
       targetLang
     });
   } catch {
-    return { name, description };
+    return { name, description, indicator };
   }
 }
 
@@ -68,4 +85,11 @@ export async function acceptAccessSession(
   accessToken: string
 ): Promise<{ ok: boolean }> {
   return postJson('/access/accept', { agentId, accessToken });
+}
+
+export async function askSupport(
+  question: string,
+  language: 'sv' | 'en'
+): Promise<{ answer: string }> {
+  return postJson('/support', { question, language });
 }

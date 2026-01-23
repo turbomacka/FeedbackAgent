@@ -220,7 +220,9 @@ const App: React.FC = () => {
     const payload = {
       name: updatedAgent.name,
       description: updatedAgent.description,
-      criteria: updatedAgent.criteria,
+      criteria: updatedAgent.criteria || existing?.criteria || [],
+      criteria_matrix: updatedAgent.criteria_matrix || existing?.criteria_matrix || [],
+      criteriaLanguage: updatedAgent.criteriaLanguage || existing?.criteriaLanguage || 'sv',
       wordCountLimit: updatedAgent.wordCountLimit,
       passThreshold: updatedAgent.passThreshold,
       verificationPrefix,
@@ -242,7 +244,9 @@ const App: React.FC = () => {
     const payload = {
       name: newAgent.name,
       description: newAgent.description,
-      criteria: newAgent.criteria,
+      criteria: newAgent.criteria || [],
+      criteria_matrix: newAgent.criteria_matrix || [],
+      criteriaLanguage: newAgent.criteriaLanguage || 'sv',
       wordCountLimit: newAgent.wordCountLimit,
       passThreshold: newAgent.passThreshold,
       verificationPrefix: newAgent.verificationPrefix,

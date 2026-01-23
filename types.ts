@@ -15,11 +15,47 @@ export interface ReferenceMaterial {
 
 export type StringencyLevel = 'generous' | 'standard' | 'strict';
 
+export interface CriterionMatrixItem {
+  id: string;
+  name: string;
+  description: string;
+  indicator: string;
+  translations?: {
+    sv?: { name?: string; description?: string; indicator?: string };
+    en?: { name?: string; description?: string; indicator?: string };
+  };
+  indicator_status?: 'ok' | 'cannot_operationalize' | 'needs_generation';
+  indicator_actor?: string;
+  indicator_verb?: string;
+  indicator_object?: string;
+  indicator_artifact?: string;
+  indicator_evidence_min?: string;
+  indicator_quality?: string;
+  indicator_source_trace?: {
+    object: string[];
+    evidence_min: string[];
+    quality: string[];
+  };
+  bloom_level: string;
+  bloom_index: number;
+  reliability_score: number;
+  weight: number;
+  clarity_label?: 'OTYDLIG' | 'MELLAN' | 'TYDLIG';
+  clarity_debug?: {
+    actor: string;
+    verb: string;
+    object: string;
+    evidence: string;
+  };
+}
+
 export interface Agent {
   id: string;
   name: string;
   description: string;
-  criteria: string[];
+  criteria?: string[];
+  criteria_matrix?: CriterionMatrixItem[];
+  criteriaLanguage?: 'sv' | 'en';
   wordCountLimit: { min: number; max: number };
   passThreshold: number; 
   verificationPrefix?: number;
@@ -41,13 +77,15 @@ export interface AssessmentJSON {
     word_count: number;
     ref_check: 'OK' | 'MISSING';
   };
-  criteria_scores: {
+  criteria_results: {
     id: string;
-    level: 'Critical Miss' | 'OK' | 'Excellent';
-    score: number; // 0, 1, or 2
+    met: boolean;
+    score: number; // 0..1
+    evidence: string;
   }[];
   final_metrics: {
-    score_100k: number; 
+    score_100k: number;
+    reliability_index: number;
   };
   teacher_insights: {
     common_errors: string[];
@@ -74,6 +112,7 @@ export interface Submission {
   sessionId?: string;
   stringency: StringencyLevel; 
   visibleTo: string[];
+  criteria_matrix?: CriterionMatrixItem[];
   insights: {
     common_errors: string[];
     strengths: string[];
