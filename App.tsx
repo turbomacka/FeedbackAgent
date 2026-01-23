@@ -176,9 +176,6 @@ const App: React.FC = () => {
       displayName: user.displayName || '',
       updatedAt: serverTimestamp()
     };
-    if (!userProfile?.role) {
-      payload.role = 'teacher';
-    }
     void setDoc(profileRef, payload, { merge: true });
   }, [user, userProfile]);
 

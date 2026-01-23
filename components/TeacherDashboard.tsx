@@ -57,6 +57,8 @@ const BLOOM_LEVELS = [
 
 const MODEL_TASKS = [
   { id: 'assessment', labelKey: 'modelTaskAssessment' },
+  { id: 'assessmentB', labelKey: 'modelTaskAssessmentB' },
+  { id: 'adjudicator', labelKey: 'modelTaskAdjudicator' },
   { id: 'feedback', labelKey: 'modelTaskFeedback' },
   { id: 'criterionAnalyze', labelKey: 'modelTaskCriterionAnalyze' },
   { id: 'criterionImprove', labelKey: 'modelTaskCriterionImprove' },
@@ -338,7 +340,49 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       sv: 'Välj provider och modell för varje del av systemet. Pris anges manuellt per modell.',
       en: 'Choose provider and model per task. Price is entered manually per model.'
     },
+    modelTaskAssessmentHelp: {
+      sv: 'Primär bedömning som avgör pass/fail och sätter score_100k (intern sammanvägd poäng). Detta är “Model A” i triage‑flödet och jämförs mot Bedömning B.',
+      en: 'Primary assessment that determines pass/fail and sets score_100k (internal aggregate score). This is “Model A” in the triage flow and is compared against Assessment B.'
+    },
+    modelTaskAssessmentBHelp: {
+      sv: 'Oberoende kontrollbedömning (“Model B”) för gränsfall. Om A och B skiljer sig kan Skiljedomare aktiveras.',
+      en: 'Independent second assessment (“Model B”) for edge cases. If A and B disagree, the Adjudicator may be triggered.'
+    },
+    modelTaskAdjudicatorHelp: {
+      sv: 'Aktiveras endast vid osäkerhet eller oenighet mellan A/B. Ger slutbeslut och kan trigga manuell granskning.',
+      en: 'Used only when A/B are uncertain or disagree. Produces the final decision and can trigger human review.'
+    },
+    modelTaskFeedbackHelp: {
+      sv: 'Genererar studentens återkoppling. Använder bedömningsdata men påverkar inte pass/fail.',
+      en: 'Generates student feedback. Uses assessment data but does not affect pass/fail.'
+    },
+    modelTaskCriterionAnalyzeHelp: {
+      sv: 'Tolkar kriterier och indikatorer (Bloom‑nivå + tydlighet). Förbättrar matrisen men påverkar inte bedömningen direkt.',
+      en: 'Analyzes criteria and indicators (Bloom level + clarity). Improves the matrix but does not directly affect assessment.'
+    },
+    modelTaskCriterionImproveHelp: {
+      sv: 'Fyller i saknade delar i matrisen och operationaliserar indikatorer. Används innan bedömning.',
+      en: 'Fills missing matrix fields and operationalizes indicators. Used before assessment.'
+    },
+    modelTaskSupportHelp: {
+      sv: 'Svarar på frågor om funktion och flöde. Har ingen påverkan på bedömning eller studentdata.',
+      en: 'Answers questions about the system flow. No impact on assessment or student data.'
+    },
+    modelTaskTranslateHelp: {
+      sv: 'Översätter matrisinnehåll utan ny analys. Påverkar inte Bloom/tydlighet.',
+      en: 'Translates matrix content without re‑analysis. Does not change Bloom/clarity.'
+    },
+    modelTaskEmbeddingsHelp: {
+      sv: 'Vektorisering av referensmaterial. Styr vad LLM:en “ser” i bedömning/feedback.',
+      en: 'Embeds reference material. Controls what the LLM “sees” in assessment/feedback.'
+    },
+    modelSafeHelp: {
+      sv: 'Backup om primära bedömningsmodeller fallerar. Bör vara stabil och kostnadseffektiv.',
+      en: 'Fallback if primary assessment models fail. Should be stable and cost‑efficient.'
+    },
     modelTaskAssessment: { sv: 'Bedömning (Score)', en: 'Assessment (Score)' },
+    modelTaskAssessmentB: { sv: 'Bedömning B (Triage)', en: 'Assessment B (Triage)' },
+    modelTaskAdjudicator: { sv: 'Skiljedomare (Adjudicator)', en: 'Adjudicator' },
     modelTaskFeedback: { sv: 'Återkoppling (Feedback)', en: 'Feedback response' },
     modelTaskCriterionAnalyze: { sv: 'AI‑analys av kriterium', en: 'Criterion analysis' },
     modelTaskCriterionImprove: { sv: 'AI‑matris (Smart‑fill)', en: 'AI rubric (Smart fill)' },
@@ -449,6 +493,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       sv: 'Vikten påverkar hur mycket kriteriet vägs in i bedömningen.',
       en: 'Weight controls how much the criterion influences the assessment.'
     },
+    matrixMandatory: { sv: 'Obligatoriskt', en: 'Mandatory' },
+    matrixMandatoryHelp: {
+      sv: 'Om ett obligatoriskt kriterium inte uppfylls blir helhetsbetyget U.',
+      en: 'If a mandatory criterion is not met, the overall result becomes U.'
+    },
+    matrixMandatoryOn: { sv: 'Ja', en: 'Yes' },
+    matrixMandatoryOff: { sv: 'Nej', en: 'No' },
     matrixActions: { sv: 'Åtgärder', en: 'Actions' },
     matrixActionsHelp: { sv: 'Förbättra eller ta bort raden.', en: 'Refine or remove the row.' },
     matrixSmartFill: { sv: 'Smart Fill', en: 'Smart Fill' },
@@ -589,6 +640,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       name: '',
       description: '',
       indicator: '',
+      is_mandatory: true,
       indicator_status: 'needs_generation',
       bloom_level: '',
       bloom_index: 0,
@@ -599,7 +651,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
   const deriveLegacyCriteria = (matrix: CriterionMatrixItem[]) =>
     matrix.map(row => row.indicator || row.description || row.name).filter(Boolean);
-  const lmsMinimum = verificationPrefix ? getVerificationMinimum(verificationPrefix, passThreshold) : null;
+  const lmsMinimum = verificationPrefix ? getVerificationMinimum(verificationPrefix) : null;
   const lmsMaximum = verificationPrefix ? getVerificationMaximum() : null;
   const matrixCoverage = useMemo(() => {
     const levels = new Set(criteriaMatrix.map(row => row.bloom_index).filter(level => level > 0));
@@ -1290,7 +1342,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     scheduleMatrixSave(updated);
   };
 
-  const handleMatrixFieldChange = (id: string, field: keyof CriterionMatrixItem, value: string | number) => {
+  const handleMatrixFieldChange = (id: string, field: keyof CriterionMatrixItem, value: string | number | boolean) => {
     const updated = criteriaMatrix.map(row => {
       if (row.id !== id) return row;
       const isTextField = field === 'name' || field === 'description' || field === 'indicator';
@@ -1449,9 +1501,13 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setCriteriaLanguage(agent.criteriaLanguage || 'sv');
     const loadedMatrix = Array.isArray(agent.criteria_matrix) ? agent.criteria_matrix : [];
     const normalizedMatrix = loadedMatrix.map(row => {
-      if (row.indicator_status) return row;
-      return {
+      const normalizedRow = {
         ...row,
+        is_mandatory: row.is_mandatory !== false
+      };
+      if (row.indicator_status) return normalizedRow;
+      return {
+        ...normalizedRow,
         indicator_status: 'needs_generation',
         reliability_score: Number.NaN,
         clarity_label: undefined,
@@ -2282,11 +2338,31 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 </div>
                 {MODEL_TASKS.map(task => {
                   const taskConfig = modelRouting?.tasks?.[task.id] || { providerId: '', model: '', priceInput1M: '', priceOutput1M: '' };
+                  const health = modelRouting?.health?.[task.id];
                   const providers = getTaskProviders(task.id);
                   const models = getProviderModels(taskConfig.providerId);
+                  const tooltipKey = `${task.labelKey}Help` as keyof typeof translations;
                   return (
                     <div key={task.id} className="grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
-                      <div className="text-xs font-black text-slate-700">{t(task.labelKey as any)}</div>
+                      <div className="text-xs font-black text-slate-700 flex items-center gap-2">
+                        <span>{t(task.labelKey as any)}</span>
+                        {translations[tooltipKey] && (
+                          <EduTooltip text={t(tooltipKey as any)}>
+                            <span className="text-slate-400 text-[11px]">
+                              <i className="fas fa-circle-info" />
+                            </span>
+                          </EduTooltip>
+                        )}
+                        {health && (
+                          <EduTooltip text={health.message || (health.status === 'ok' ? 'OK' : 'Error')}>
+                            <span
+                              className={`inline-flex h-2.5 w-2.5 rounded-full ${
+                                health.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
+                              }`}
+                            />
+                          </EduTooltip>
+                        )}
+                      </div>
                       <select
                         value={taskConfig.providerId || ''}
                         onChange={(e) => handleRoutingChange(task.id, 'providerId', e.target.value)}
@@ -2330,7 +2406,23 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 })}
 
                 <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
-                  <div className="text-xs font-black text-slate-700">{t('modelTaskEmbeddings')}</div>
+                  <div className="text-xs font-black text-slate-700 flex items-center gap-2">
+                    <span>{t('modelTaskEmbeddings')}</span>
+                    <EduTooltip text={t('modelTaskEmbeddingsHelp')}>
+                      <span className="text-slate-400 text-[11px]">
+                        <i className="fas fa-circle-info" />
+                      </span>
+                    </EduTooltip>
+                    {modelRouting?.health?.embeddings && (
+                      <EduTooltip text={modelRouting.health.embeddings.message || (modelRouting.health.embeddings.status === 'ok' ? 'OK' : 'Error')}>
+                        <span
+                          className={`inline-flex h-2.5 w-2.5 rounded-full ${
+                            modelRouting.health.embeddings.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
+                          }`}
+                        />
+                      </EduTooltip>
+                    )}
+                  </div>
                   <select
                     value={modelRouting?.embeddings?.providerId || ''}
                     onChange={(e) => handleEmbeddingChange('providerId', e.target.value)}
@@ -2370,7 +2462,23 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
-                  <div className="text-xs font-black text-slate-700">{t('modelSafeLabel')}</div>
+                  <div className="text-xs font-black text-slate-700 flex items-center gap-2">
+                    <span>{t('modelSafeLabel')}</span>
+                    <EduTooltip text={t('modelSafeHelp')}>
+                      <span className="text-slate-400 text-[11px]">
+                        <i className="fas fa-circle-info" />
+                      </span>
+                    </EduTooltip>
+                    {modelRouting?.health?.safeAssessment && (
+                      <EduTooltip text={modelRouting.health.safeAssessment.message || (modelRouting.health.safeAssessment.status === 'ok' ? 'OK' : 'Error')}>
+                        <span
+                          className={`inline-flex h-2.5 w-2.5 rounded-full ${
+                            modelRouting.health.safeAssessment.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
+                          }`}
+                        />
+                      </EduTooltip>
+                    )}
+                  </div>
                   <select
                     value={modelRouting?.safeAssessment?.providerId || ''}
                     onChange={(e) => handleSafeAssessmentChange('providerId', e.target.value)}
@@ -3294,7 +3402,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
 
               <div className="overflow-x-auto overflow-y-visible border border-slate-100 rounded-[2rem] bg-white">
                 <div className="min-w-[960px]">
-                  <div className="grid grid-cols-[1.1fr_1.6fr_1.6fr_0.8fr_0.5fr_0.4fr_0.4fr] gap-3 px-6 py-3 bg-slate-50 text-[9px] font-black uppercase tracking-widest text-slate-500">
+                  <div className="grid grid-cols-[1.1fr_1.6fr_1.6fr_0.8fr_0.5fr_0.6fr_0.4fr_0.4fr] gap-3 px-6 py-3 bg-slate-50 text-[9px] font-black uppercase tracking-widest text-slate-500">
                     <div className="flex items-center gap-1">
                       {t('matrixName')}
                       <EduTooltip text={t('matrixNameHelp')}>
@@ -3322,6 +3430,12 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     <div className="flex items-center gap-1">
                       {t('matrixReliability')}
                       <EduTooltip text={t('matrixClarityHelp')}>
+                        <i className="fas fa-circle-info text-[9px] text-slate-400"></i>
+                      </EduTooltip>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {t('matrixMandatory')}
+                      <EduTooltip text={t('matrixMandatoryHelp')}>
                         <i className="fas fa-circle-info text-[9px] text-slate-400"></i>
                       </EduTooltip>
                     </div>
@@ -3358,7 +3472,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                             ? t('matrixIndicatorNeeds')
                             : indicatorText || t('matrixIndicatorPlaceholder');
                         return (
-                          <div key={row.id} className="grid grid-cols-[1.1fr_1.6fr_1.6fr_0.8fr_0.5fr_0.4fr_0.4fr] gap-3 px-6 py-4 items-start">
+                          <div key={row.id} className="grid grid-cols-[1.1fr_1.6fr_1.6fr_0.8fr_0.5fr_0.6fr_0.4fr_0.4fr] gap-3 px-6 py-4 items-start">
                             <input
                               className="w-full px-3 py-2 rounded-xl border border-slate-100 bg-slate-50 text-[11px] font-semibold"
                               value={getMatrixText(row, 'name')}
@@ -3395,6 +3509,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                             </div>
                             <div className={`text-[11px] font-black ${clarityDisplay.color}`}>
                               {clarityDisplay.label}
+                            </div>
+                            <div className="flex items-center justify-center">
+                              <label className="inline-flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                                <input
+                                  type="checkbox"
+                                  className="accent-indigo-600"
+                                  checked={row.is_mandatory !== false}
+                                  onChange={(e) => handleMatrixFieldChange(row.id, 'is_mandatory', e.target.checked)}
+                                />
+                                {row.is_mandatory === false ? t('matrixMandatoryOff') : t('matrixMandatoryOn')}
+                              </label>
                             </div>
                             <input
                               type="number"

@@ -68,7 +68,7 @@ const embeddingClient = new aiplatform.v1.PredictionServiceClient({
 const indexClient = new aiplatform.v1.IndexServiceClient({
   apiEndpoint: `${VERTEX_LOCATION}-aiplatform.googleapis.com`,
 });
-const indexEndpointClient = new aiplatform.v1.IndexEndpointServiceClient({
+const matchClient = new aiplatform.v1.MatchServiceClient({
   apiEndpoint: `${VERTEX_LOCATION}-aiplatform.googleapis.com`,
 });
 
@@ -108,6 +108,7 @@ interface ModelRoutingConfig {
   safeAssessment: ModelTaskConfig;
   pricingCurrency: string;
   updatedAt?: admin.firestore.FieldValue | admin.firestore.Timestamp | null;
+  health?: Record<string, { status: 'ok' | 'error'; checkedAt: number; message?: string }>;
 }
 
 const MODEL_PROVIDERS_COLLECTION = 'modelProviders';
@@ -117,6 +118,8 @@ const MODEL_CONFIG_TTL_MS = 60_000;
 
 const DEFAULT_TASK_MODELS: Record<string, ModelTaskConfig> = {
   assessment: { providerId: 'gemini', model: 'gemini-3-flash-preview' },
+  assessmentB: { providerId: 'gemini', model: 'gemini-3-flash-preview' },
+  adjudicator: { providerId: 'gemini', model: 'gemini-3-pro-preview' },
   feedback: { providerId: 'gemini', model: 'gemini-3-flash-preview' },
   criterionAnalyze: { providerId: 'gemini', model: 'gemini-3-flash-preview' },
   criterionImprove: { providerId: 'gemini', model: 'gemini-3-pro-preview' },
@@ -224,9 +227,12 @@ For each criterion, use the Indicator to determine if the requirement is met.
 Return criteria_results for every criterion id with:
 - id: criterion id
 - met: boolean
-- score: number in [0,1] (1 = clearly met, 0.5 = partially met, 0 = not met)
-- evidence: a short, concrete justification
+- score: number in [0,100] (100 = clearly met, 50 = partially met, 0 = not met)
+- evidence_quote: an exact quote from the student text that supports your decision (min 30 chars). If no exact quote exists, return an empty string.
+- self_reflection_score: number in [0,100] reflecting your confidence (100 = fully confident).
 Score_100k will be computed as a weighted average of the criteria (weights provided), normalized to 0–100,000.
+
+EVIDENCE REQUIREMENT: evidence_quote MUST be a literal excerpt from the student text. Do not paraphrase or alter punctuation. If you cannot find an exact quote, leave it empty.
 
 ${STRINGENCY_MODULES[stringency]}
 
@@ -454,6 +460,12 @@ const PREFIX_MIN = 200;
 const PREFIX_MAX = 998;
 const SCORE_BUCKET_DIVISOR = 100;
 const SCORE_BUCKET_MULTIPLIER = 1000;
+const CRITERION_PASS_THRESHOLD = 70;
+const BOUNDARY_MARGIN = 5;
+const EVIDENCE_MIN_CHARS = 30;
+const FUZZY_MATCH_THRESHOLD = 0.85;
+const ASSESSMENT_TIMEOUT_MS = 15_000;
+const ADJUDICATOR_TIMEOUT_MS = 20_000;
 
 const clampNumber = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, Math.round(value)));
@@ -469,6 +481,98 @@ const normalizeWeight = (value: unknown) => {
 const normalizeReliability = (value: unknown) => {
   const numeric = typeof value === 'number' && Number.isFinite(value) ? value : 0.6;
   return Math.min(1, Math.max(0, numeric));
+};
+
+const normalizeMatchText = (text: string) =>
+  text
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[“”]/g, '"')
+    .replace(/[’]/g, "'")
+    .trim();
+
+const buildBigrams = (text: string) => {
+  const map = new Map<string, number>();
+  if (text.length < 2) return map;
+  for (let i = 0; i < text.length - 1; i += 1) {
+    const pair = text.slice(i, i + 2);
+    map.set(pair, (map.get(pair) || 0) + 1);
+  }
+  return map;
+};
+
+const diceCoefficient = (a: string, b: string) => {
+  if (!a || !b) return 0;
+  const aMap = buildBigrams(a);
+  const bMap = buildBigrams(b);
+  if (!aMap.size || !bMap.size) return 0;
+  let intersection = 0;
+  aMap.forEach((count, key) => {
+    const bCount = bMap.get(key) || 0;
+    intersection += Math.min(count, bCount);
+  });
+  const total = Array.from(aMap.values()).reduce((sum, count) => sum + count, 0)
+    + Array.from(bMap.values()).reduce((sum, count) => sum + count, 0);
+  return total > 0 ? (2 * intersection) / total : 0;
+};
+
+const fuzzyContains = (haystack: string, needle: string, threshold: number) => {
+  const normalizedNeedle = normalizeMatchText(needle);
+  if (!normalizedNeedle) return false;
+  const normalizedHaystack = normalizeMatchText(haystack);
+  if (!normalizedHaystack) return false;
+  if (normalizedHaystack.includes(normalizedNeedle)) return true;
+  if (normalizedNeedle.length < EVIDENCE_MIN_CHARS) return false;
+  const windowSize = Math.min(Math.max(normalizedNeedle.length + 50, 200), 800);
+  const step = Math.max(Math.floor(windowSize / 2), 120);
+  for (let i = 0; i < normalizedHaystack.length; i += step) {
+    const window = normalizedHaystack.slice(i, i + windowSize);
+    if (diceCoefficient(normalizedNeedle, window) >= threshold) {
+      return true;
+    }
+  }
+  return false;
+};
+
+const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> => {
+  let timeoutId: NodeJS.Timeout | null = null;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${label} timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId);
+    }
+  }
+};
+
+const extractJsonFromText = (text: string) => {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end === -1 || end <= start) {
+    return text;
+  }
+  return text.slice(start, end + 1);
+};
+
+const parseJsonFromText = (text: string) => {
+  const candidate = extractJsonFromText(text);
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+};
+
+const validateEvidenceQuote = (studentText: string, quote: string) => {
+  if (!quote) return false;
+  const trimmed = quote.trim();
+  if (trimmed.length < EVIDENCE_MIN_CHARS) return false;
+  return fuzzyContains(studentText, trimmed, FUZZY_MATCH_THRESHOLD);
 };
 
 const classifyIndicatorClarityParts = (verb: string, object: string, evidence: string) => {
@@ -530,10 +634,24 @@ const randomPrefixBelow = (minPrefix: number) => {
 };
 
 async function logAudit(event: string, details: Record<string, unknown>) {
+  const sanitize = (value: unknown): unknown => {
+    if (value === undefined) return null;
+    if (Array.isArray(value)) {
+      return value.map(item => sanitize(item));
+    }
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>).map(([key, val]) => [key, sanitize(val)])
+      );
+    }
+    return value;
+  };
+
+  const safeDetails = sanitize(details) as Record<string, unknown>;
   await db.collection('auditLogs').add({
     event,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    ...details
+    ...safeDetails
   });
 }
 
@@ -715,6 +833,95 @@ async function assertAllowedBaseUrl(baseUrl: string) {
   return `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`;
 }
 
+async function testChatModel(config: ModelTaskConfig) {
+  if (!config?.providerId || !config?.model) {
+    throw new Error('Missing provider or model.');
+  }
+  await generateWithProvider({
+    providerId: config.providerId,
+    model: config.model,
+    contents: { parts: [{ text: 'Ping. Return OK.' }] },
+    config: { systemInstruction: 'Return OK.', temperature: 0 }
+  });
+}
+
+async function testEmbeddingModel(config: ModelTaskConfig) {
+  if (!config?.providerId || !config?.model) {
+    throw new Error('Missing provider or model.');
+  }
+  const providers = await getProviders();
+  const provider = providers.find(item => item.id === config.providerId);
+  if (!provider || !provider.enabled) {
+    throw new Error('Provider is not available.');
+  }
+
+  if (provider.type === 'openai-compatible') {
+    if (!provider.capabilities?.embeddings) {
+      throw new Error('Provider does not support embeddings.');
+    }
+    const secretName = provider.secretName || 'OPENAI_API_KEY';
+    const apiKey = process.env[secretName] || '';
+    if (!apiKey) {
+      throw new Error(`${secretName} is not configured.`);
+    }
+    const baseUrl = await assertAllowedBaseUrl(provider.baseUrl || '');
+    const response = await fetch(`${baseUrl}/embeddings`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({ model: config.model, input: ['ping'] })
+    });
+    if (!response.ok) {
+      throw new Error(await response.text());
+    }
+    const payload = await response.json();
+    const data = Array.isArray(payload?.data) ? payload.data : [];
+    if (!data.length) {
+      throw new Error('No embeddings returned.');
+    }
+    return;
+  }
+
+  const location = provider.location || EMBEDDING_LOCATION;
+  const endpoint = buildEmbeddingEndpoint(config.model, location);
+  if (!endpoint) {
+    throw new Error('Embedding endpoint is missing.');
+  }
+  const embeddingClientForRegion = location === EMBEDDING_LOCATION
+    ? embeddingClient
+    : new aiplatform.v1.PredictionServiceClient({ apiEndpoint: `${location}-aiplatform.googleapis.com` });
+  const instances = [aiplatform.helpers.toValue({ content: 'ping' })];
+  const [response] = await (embeddingClientForRegion as any).predict({ endpoint, instances } as any);
+  const predictions = response?.predictions || [];
+  if (!predictions.length) {
+    throw new Error('No embeddings returned.');
+  }
+}
+
+async function runRoutingHealthChecks(routing: ModelRoutingConfig) {
+  const now = Date.now();
+  const health: Record<string, { status: 'ok' | 'error'; checkedAt: number; message?: string }> = {};
+
+  const check = async (key: string, fn: () => Promise<void>) => {
+    try {
+      await fn();
+      health[key] = { status: 'ok', checkedAt: now };
+    } catch (error: any) {
+      health[key] = { status: 'error', checkedAt: now, message: error?.message || String(error) };
+    }
+  };
+
+  const taskEntries = Object.entries(routing.tasks || {});
+  for (const [task, config] of taskEntries) {
+    await check(task, async () => testChatModel(config));
+  }
+  await check('embeddings', async () => testEmbeddingModel(routing.embeddings));
+  await check('safeAssessment', async () => testChatModel(routing.safeAssessment));
+  return health;
+}
+
 function mergeRoutingDefaults(routing?: Partial<ModelRoutingConfig> | null): ModelRoutingConfig {
   const safeTasks: Record<string, ModelTaskConfig> = { ...DEFAULT_TASK_MODELS };
   const inputTasks = routing?.tasks || {};
@@ -724,8 +931,8 @@ function mergeRoutingDefaults(routing?: Partial<ModelRoutingConfig> | null): Mod
       safeTasks[task] = {
         providerId: config.providerId,
         model: config.model,
-        priceInput1M: config.priceInput1M || legacyPrice,
-        priceOutput1M: config.priceOutput1M || legacyPrice
+        priceInput1M: config.priceInput1M ?? legacyPrice ?? '',
+        priceOutput1M: config.priceOutput1M ?? legacyPrice ?? ''
       };
     }
   });
@@ -736,8 +943,8 @@ function mergeRoutingDefaults(routing?: Partial<ModelRoutingConfig> | null): Mod
     ? {
         providerId: embedding.providerId,
         model: embedding.model,
-        priceInput1M: embedding.priceInput1M || legacyEmbedPrice,
-        priceOutput1M: embedding.priceOutput1M || legacyEmbedPrice
+        priceInput1M: embedding.priceInput1M ?? legacyEmbedPrice ?? '',
+        priceOutput1M: embedding.priceOutput1M ?? legacyEmbedPrice ?? ''
       }
     : { ...DEFAULT_MODEL_ROUTING.embeddings };
 
@@ -746,8 +953,8 @@ function mergeRoutingDefaults(routing?: Partial<ModelRoutingConfig> | null): Mod
     ? {
         providerId: routing.safeAssessment.providerId,
         model: routing.safeAssessment.model,
-        priceInput1M: routing.safeAssessment.priceInput1M || legacySafePrice,
-        priceOutput1M: routing.safeAssessment.priceOutput1M || legacySafePrice
+        priceInput1M: routing.safeAssessment.priceInput1M ?? legacySafePrice ?? '',
+        priceOutput1M: routing.safeAssessment.priceOutput1M ?? legacySafePrice ?? ''
       }
     : { ...DEFAULT_MODEL_ROUTING.safeAssessment };
 
@@ -865,7 +1072,10 @@ async function generateWithProvider(params: {
       messages
     };
     if (typeof config?.temperature === 'number') {
-      body.temperature = config.temperature;
+      const isO3 = /^o3/i.test(model);
+      if (!(isO3 && config.temperature === 0)) {
+        body.temperature = config.temperature;
+      }
     }
     if (provider.capabilities?.jsonMode && config?.responseMimeType === 'application/json') {
       body.response_format = { type: 'json_object' };
@@ -1421,7 +1631,7 @@ async function getReferenceContext(agentId: string, queryText: string) {
       returnFullDatapoint: true
     };
 
-    const [response] = await (indexEndpointClient as any).findNeighbors(request);
+    const [response] = await (matchClient as any).findNeighbors(request);
     const neighbors = response.nearestNeighbors?.[0]?.neighbors || [];
     const ids = neighbors
       .map((neighbor: any) => neighbor.datapoint?.datapointId)
@@ -1862,9 +2072,11 @@ apiRouter.post('/admin/model-config', async (req, res) => {
     if (!authUser) return;
     const { routing, allowlist } = req.body || {};
     const nextRouting = mergeRoutingDefaults(routing);
+    const health = await runRoutingHealthChecks(nextRouting);
     await db.doc(MODEL_ROUTING_DOC).set(
       {
         ...nextRouting,
+        health,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         updatedBy: authUser.uid
       },
@@ -1879,7 +2091,7 @@ apiRouter.post('/admin/model-config', async (req, res) => {
       allowlistCache = null;
     }
     modelRoutingCache = null;
-    return res.json({ ok: true, routing: nextRouting });
+    return res.json({ ok: true, routing: { ...nextRouting, health } });
   } catch (error: any) {
     logger.error('Model config update error', error);
     return res.status(500).send(error.message || 'Failed to update model config.');
@@ -2278,6 +2490,7 @@ apiRouter.post('/assessment', async (req, res) => {
           name: criterion,
           description: criterion,
           indicator: criterion,
+          is_mandatory: true,
           bloom_level: 'Unspecified',
           bloom_index: 0,
           reliability_score: 0.6,
@@ -2295,12 +2508,14 @@ apiRouter.post('/assessment', async (req, res) => {
       const id = typeof criterion?.id === 'string' && criterion.id.trim()
         ? criterion.id.trim()
         : `criterion-${index + 1}`;
+      const isMandatory = criterion?.is_mandatory !== false;
 
       return {
         id,
         name: name || `Kriterium ${index + 1}`,
         description: description || name || indicator || `Kriterium ${index + 1}`,
         indicator: indicator || description || name || `Kriterium ${index + 1}`,
+        is_mandatory: isMandatory,
         bloom_level: typeof criterion?.bloom_level === 'string' ? criterion.bloom_level : 'Unspecified',
         bloom_index: typeof criterion?.bloom_index === 'number' ? criterion.bloom_index : 0,
         reliability_score: normalizeReliability(criterion?.reliability_score),
@@ -2320,167 +2535,377 @@ apiRouter.post('/assessment', async (req, res) => {
       ? { text: `REFERENCE MATERIAL (RAG):\n${referenceContext}` }
       : { text: 'REFERENCE MATERIAL (RAG): None provided.' };
 
-    const assessmentModel = await resolveTaskModel('assessment');
-    let gradingResponse;
+    const criteriaById = new Map<string, any>();
+    criteriaForPrompt.forEach((criterion: any) => {
+      criteriaById.set(criterion.id, criterion);
+    });
+
+    const assessmentResponseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        formalia: {
+          type: Type.OBJECT,
+          properties: {
+            status: { type: Type.STRING },
+            word_count: { type: Type.NUMBER },
+            ref_check: { type: Type.STRING }
+          },
+          required: ['status', 'word_count', 'ref_check']
+        },
+        criteria_results: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              id: { type: Type.STRING },
+              met: { type: Type.BOOLEAN },
+              score: { type: Type.NUMBER },
+              evidence_quote: { type: Type.STRING },
+              self_reflection_score: { type: Type.NUMBER }
+            },
+            required: ['id', 'met', 'score', 'evidence_quote', 'self_reflection_score']
+          }
+        },
+        teacher_insights: {
+          type: Type.OBJECT,
+          properties: {
+            common_errors: { type: Type.ARRAY, items: { type: Type.STRING } },
+            strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
+            teaching_actions: { type: Type.ARRAY, items: { type: Type.STRING } }
+          },
+          required: ['common_errors', 'strengths', 'teaching_actions']
+        }
+      },
+      required: ['formalia', 'criteria_results', 'teacher_insights']
+    };
+
+    const assessmentContents = { parts: [referencePart, contextPart, studentPart] };
+    const assessmentSystemPrompt = PROMPT_B_SYSTEM(stringency);
+    const jsonRetrySuffix = '\n\nInvalid JSON. Output ONLY the JSON object and nothing else.';
+
+    const runAssessmentModel = async (modelConfig: ModelTaskConfig, label: string, timeoutMs: number) => {
+      const runOnce = async (systemInstruction: string, temperature?: number) => {
+        const startedAt = Date.now();
+        const response = await withTimeout(
+          generateWithProvider({
+            providerId: modelConfig.providerId,
+            model: modelConfig.model,
+            contents: assessmentContents,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              responseSchema: assessmentResponseSchema,
+              temperature
+            }
+          }),
+          timeoutMs,
+          label
+        );
+        const latencyMs = Date.now() - startedAt;
+        const parsed = parseJsonFromText(response.text || '');
+        if (!parsed) {
+          throw new Error('invalid_json');
+        }
+        return { parsed, latencyMs };
+      };
+
+      try {
+        return await runOnce(assessmentSystemPrompt);
+      } catch (error: any) {
+        if (String(error?.message || error).includes('invalid_json')) {
+          try {
+            return await runOnce(`${assessmentSystemPrompt}${jsonRetrySuffix}`, 0);
+          } catch (retryError: any) {
+            if (String(retryError?.message || retryError).includes('invalid_json')) {
+              throw new Error('invalid_json');
+            }
+            throw retryError;
+          }
+        }
+        throw error;
+      }
+    };
+
+    const normalizeAssessmentResults = (assessment: any) => {
+      const rawResults = Array.isArray(assessment?.criteria_results) ? assessment.criteria_results : [];
+      const resultById = new Map<string, any>();
+      rawResults.forEach((result: any) => {
+        const id = typeof result?.id === 'string' ? result.id : String(result?.id || '');
+        if (id) {
+          resultById.set(id, result);
+        }
+      });
+
+      let evidenceFailures = 0;
+      let selfReflectionTotal = 0;
+      let boundaryHit = false;
+      const criteriaResults = criteriaForPrompt.map((criterion: any) => {
+        const result = resultById.get(criterion.id);
+        const met = Boolean(result?.met);
+        let score = typeof result?.score === 'number' && Number.isFinite(result.score)
+          ? result.score
+          : (met ? 100 : 0);
+        if (score <= 1) {
+          score = score * 100;
+        }
+        score = clampFloat(score, 0, 100);
+        if (score >= CRITERION_PASS_THRESHOLD - BOUNDARY_MARGIN
+          && score <= CRITERION_PASS_THRESHOLD + BOUNDARY_MARGIN) {
+          boundaryHit = true;
+        }
+        const evidenceQuote = typeof result?.evidence_quote === 'string' ? result.evidence_quote.trim() : '';
+        const evidenceValid = validateEvidenceQuote(studentText, evidenceQuote);
+        if (!evidenceValid) {
+          evidenceFailures += 1;
+        }
+        const selfReflection = typeof result?.self_reflection_score === 'number'
+          ? clampFloat(result.self_reflection_score, 0, 100)
+          : 50;
+        selfReflectionTotal += selfReflection;
+        return {
+          id: criterion.id,
+          met,
+          score,
+          evidence_quote: evidenceQuote,
+          self_reflection_score: selfReflection,
+          evidence_valid: evidenceValid
+        };
+      });
+
+      const evidenceGapScore = criteriaResults.length ? evidenceFailures / criteriaResults.length : 0;
+      const avgSelfReflection = criteriaResults.length ? selfReflectionTotal / criteriaResults.length : 50;
+      const passFail = criteriaResults.every((result) => {
+        const criterion = criteriaById.get(result.id);
+        const mandatory = criterion?.is_mandatory !== false;
+        return !mandatory || result.met;
+      }) ? 'G' : 'U';
+      return {
+        criteriaResults,
+        evidenceGapScore,
+        avgSelfReflection,
+        boundaryScore: boundaryHit ? 1 : 0,
+        passFail
+      };
+    };
+
+    const assessmentModelA = await resolveTaskModel('assessment');
+    const assessmentModelB = await resolveTaskModel('assessmentB');
+    const adjudicatorModel = await resolveTaskModel('adjudicator');
+
+    let modelAResponse: { parsed: any; latencyMs: number } | null = null;
+    let modelBResponse: { parsed: any; latencyMs: number } | null = null;
+    let modelAError: string | null = null;
+    let modelBError: string | null = null;
+
     try {
-      gradingResponse = await generateWithProvider({
-        providerId: assessmentModel.providerId,
-        model: assessmentModel.model,
-        contents: { parts: [referencePart, contextPart, studentPart] },
-        config: {
-          systemInstruction: PROMPT_B_SYSTEM(stringency),
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              formalia: {
-                type: Type.OBJECT,
-                properties: {
-                  status: { type: Type.STRING },
-                  word_count: { type: Type.NUMBER },
-                  ref_check: { type: Type.STRING }
-                },
-                required: ['status', 'word_count', 'ref_check']
-              },
-              criteria_results: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    met: { type: Type.BOOLEAN },
-                    score: { type: Type.NUMBER },
-                    evidence: { type: Type.STRING }
-                  },
-                  required: ['id', 'met', 'score', 'evidence']
-                }
-              },
-              teacher_insights: {
-                type: Type.OBJECT,
-                properties: {
-                  common_errors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  teaching_actions: { type: Type.ARRAY, items: { type: Type.STRING } }
-                },
-                required: ['common_errors', 'strengths', 'teaching_actions']
-              }
-            },
-            required: ['formalia', 'criteria_results', 'teacher_insights']
-          }
-        }
-      });
+      modelAResponse = await runAssessmentModel(assessmentModelA, 'Model A', ASSESSMENT_TIMEOUT_MS);
     } catch (error: any) {
-      const fallback = (await getModelRouting()).safeAssessment || DEFAULT_MODEL_ROUTING.safeAssessment;
-      logger.warn('Assessment model failed, using fallback.', {
-        providerId: assessmentModel.providerId,
-        model: assessmentModel.model,
-        fallbackProvider: fallback.providerId,
-        fallbackModel: fallback.model,
-        error: error?.message || error
-      });
-      await logAudit('assessment_fallback', {
-        agentId,
-        providerId: assessmentModel.providerId,
-        model: assessmentModel.model,
-        fallbackProvider: fallback.providerId,
-        fallbackModel: fallback.model,
-        error: error?.message || String(error)
-      });
-      gradingResponse = await generateWithProvider({
-        providerId: fallback.providerId,
-        model: fallback.model,
-        contents: { parts: [referencePart, contextPart, studentPart] },
-        config: {
-          systemInstruction: PROMPT_B_SYSTEM(stringency),
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              formalia: {
-                type: Type.OBJECT,
-                properties: {
-                  status: { type: Type.STRING },
-                  word_count: { type: Type.NUMBER },
-                  ref_check: { type: Type.STRING }
-                },
-                required: ['status', 'word_count', 'ref_check']
-              },
-              criteria_results: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    id: { type: Type.STRING },
-                    met: { type: Type.BOOLEAN },
-                    score: { type: Type.NUMBER },
-                    evidence: { type: Type.STRING }
-                  },
-                  required: ['id', 'met', 'score', 'evidence']
-                }
-              },
-              teacher_insights: {
-                type: Type.OBJECT,
-                properties: {
-                  common_errors: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  strengths: { type: Type.ARRAY, items: { type: Type.STRING } },
-                  teaching_actions: { type: Type.ARRAY, items: { type: Type.STRING } }
-                },
-                required: ['common_errors', 'strengths', 'teaching_actions']
-              }
-            },
-            required: ['formalia', 'criteria_results', 'teacher_insights']
-          }
-        }
-      });
+      modelAError = String(error?.message || error);
     }
 
-    const assessmentText = gradingResponse.text || '{}';
-    const assessment = JSON.parse(assessmentText);
-    const rawResults = Array.isArray(assessment?.criteria_results) ? assessment.criteria_results : [];
-    const resultById = new Map<string, any>();
-    rawResults.forEach((result: any) => {
-      const id = typeof result?.id === 'string' ? result.id : String(result?.id || '');
-      if (id) {
-        resultById.set(id, result);
-      }
-    });
+    try {
+      modelBResponse = await runAssessmentModel(assessmentModelB, 'Model B', ASSESSMENT_TIMEOUT_MS);
+    } catch (error: any) {
+      modelBError = String(error?.message || error);
+    }
 
-    const criteriaResults = criteriaForPrompt.map((criterion: any) => {
-      const result = resultById.get(criterion.id);
-      const met = Boolean(result?.met);
-      const score = typeof result?.score === 'number' && Number.isFinite(result.score)
-        ? clampFloat(result.score, 0, 1)
-        : (met ? 1 : 0);
-      const evidence = typeof result?.evidence === 'string' ? result.evidence : '';
-      return { id: criterion.id, met, score, evidence };
-    });
-
-    let weightedSum = 0;
-    let weightTotal = 0;
-    criteriaResults.forEach((result) => {
-      const criterion = criteriaForPrompt.find((item: any) => item.id === result.id);
-      const weight = normalizeWeight(criterion?.weight);
-      weightedSum += result.score * weight;
-      weightTotal += weight;
-    });
-    const score = weightTotal > 0 ? Math.round((weightedSum / weightTotal) * 100000) : 0;
-
-    const assessmentNormalized = {
-      formalia: assessment.formalia || {
+    const fallbackAssessment = {
+      formalia: {
         status: 'PASS',
         word_count: studentText.trim().split(/\s+/).filter(Boolean).length,
         ref_check: 'OK'
       },
-      criteria_results: criteriaResults,
-      final_metrics: {
-        score_100k: score,
-        reliability_index: clampFloat(reliabilityIndex, 0, 1)
-      },
-      teacher_insights: assessment.teacher_insights || {
+      criteria_results: [],
+      teacher_insights: {
         common_errors: [],
         strengths: [],
         teaching_actions: []
       }
+    };
+
+    const modelAParsed = modelAResponse?.parsed || null;
+    const modelBParsed = modelBResponse?.parsed || null;
+
+    const modelANormalized = modelAParsed ? normalizeAssessmentResults(modelAParsed) : null;
+    const modelBNormalized = modelBParsed ? normalizeAssessmentResults(modelBParsed) : null;
+    const modelAValid = Boolean(modelANormalized);
+    const modelBValid = Boolean(modelBNormalized);
+    const invalidJsonFailure = (!modelAValid && modelAError?.includes('invalid_json'))
+      && (!modelBValid && modelBError?.includes('invalid_json'));
+    const timeoutFailure = [modelAError, modelBError].some((message) => message?.includes('timeout'));
+    const hardFailure = !modelAValid && !modelBValid;
+
+    let difficultyScore = 1;
+    let disagreementScore = 1;
+    let boundaryScore = 0;
+    let evidenceGapScore = 1;
+    let avgSelfReflection = 0;
+    let reviewTrigger: 'CONSENSUS' | 'DISAGREEMENT' | 'HIGH_UNCERTAINTY' | 'TIMEOUT_FALLBACK' = 'TIMEOUT_FALLBACK';
+    let finalDecisionSource: 'MODELS_AB' | 'ADJUDICATOR' | 'HUMAN_REQUIRED' = 'HUMAN_REQUIRED';
+    let isEscalated = true;
+    let finalAssessment = modelAParsed || modelBParsed || fallbackAssessment;
+    let finalNormalized = modelANormalized || modelBNormalized || {
+      criteriaResults: criteriaForPrompt.map((criterion: any) => ({
+        id: criterion.id,
+        met: false,
+        score: 0,
+        evidence_quote: '',
+        self_reflection_score: 0,
+        evidence_valid: false
+      })),
+      evidenceGapScore: 1,
+      avgSelfReflection: 0,
+      boundaryScore: 0,
+      passFail: 'U'
+    };
+
+    evidenceGapScore = finalNormalized.evidenceGapScore;
+    avgSelfReflection = finalNormalized.avgSelfReflection;
+
+    if (!invalidJsonFailure && modelANormalized && modelBNormalized) {
+      disagreementScore = modelANormalized.passFail !== modelBNormalized.passFail ? 1 : 0;
+      boundaryScore = Math.max(modelANormalized.boundaryScore, modelBNormalized.boundaryScore);
+      avgSelfReflection = (modelANormalized.avgSelfReflection + modelBNormalized.avgSelfReflection) / 2;
+      const selfReflectionScore = clampFloat((100 - avgSelfReflection) / 100, 0, 1);
+      evidenceGapScore = Math.max(modelANormalized.evidenceGapScore, modelBNormalized.evidenceGapScore);
+      difficultyScore = (0.5 * disagreementScore)
+        + (0.2 * boundaryScore)
+        + (0.15 * selfReflectionScore)
+        + (0.15 * evidenceGapScore);
+
+      const shouldEscalate = disagreementScore === 1 || difficultyScore > 0.7;
+      reviewTrigger = disagreementScore === 1 ? 'DISAGREEMENT' : (shouldEscalate ? 'HIGH_UNCERTAINTY' : 'CONSENSUS');
+      isEscalated = shouldEscalate;
+      finalDecisionSource = 'MODELS_AB';
+
+      if (timeoutFailure) {
+        difficultyScore = 1;
+        reviewTrigger = 'TIMEOUT_FALLBACK';
+        isEscalated = true;
+      }
+
+      if (shouldEscalate) {
+        const adjudicatorPrompt = `${assessmentSystemPrompt}\n\nResolve any disagreement between the two assessments. Use the student text and indicators to decide.`;
+        try {
+          const adjudicatorResponse = await withTimeout(
+            generateWithProvider({
+              providerId: adjudicatorModel.providerId,
+              model: adjudicatorModel.model,
+              contents: {
+                parts: [
+                  referencePart,
+                  contextPart,
+                  { text: `MODEL_A_ASSESSMENT:\n${JSON.stringify(modelAParsed)}` },
+                  { text: `MODEL_B_ASSESSMENT:\n${JSON.stringify(modelBParsed)}` },
+                  studentPart
+                ]
+              },
+              config: {
+                systemInstruction: adjudicatorPrompt,
+                responseMimeType: 'application/json',
+                responseSchema: assessmentResponseSchema
+              }
+            }),
+            ADJUDICATOR_TIMEOUT_MS,
+            'Adjudicator'
+          );
+          const adjudicatorParsed = parseJsonFromText(adjudicatorResponse.text || '');
+          if (!adjudicatorParsed) {
+            throw new Error('invalid_json');
+          }
+          finalAssessment = adjudicatorParsed;
+          finalNormalized = normalizeAssessmentResults(adjudicatorParsed);
+          finalDecisionSource = 'ADJUDICATOR';
+        } catch (error: any) {
+          finalDecisionSource = 'HUMAN_REQUIRED';
+          reviewTrigger = 'TIMEOUT_FALLBACK';
+          isEscalated = true;
+        }
+      } else {
+        finalAssessment = modelAParsed;
+        finalNormalized = modelANormalized;
+      }
+    } else if (!invalidJsonFailure && (modelANormalized || modelBNormalized)) {
+      difficultyScore = 1;
+      reviewTrigger = 'TIMEOUT_FALLBACK';
+      isEscalated = true;
+      const adjudicatorPrompt = `${assessmentSystemPrompt}\n\nResolve the assessment using the available analysis. If a model output is missing, proceed with the evidence you have.`;
+      try {
+        const adjudicatorResponse = await withTimeout(
+          generateWithProvider({
+            providerId: adjudicatorModel.providerId,
+            model: adjudicatorModel.model,
+            contents: {
+              parts: [
+                referencePart,
+                contextPart,
+                { text: `MODEL_A_ASSESSMENT:\n${JSON.stringify(modelAParsed)}` },
+                { text: `MODEL_B_ASSESSMENT:\n${JSON.stringify(modelBParsed)}` },
+                studentPart
+              ]
+            },
+            config: {
+              systemInstruction: adjudicatorPrompt,
+              responseMimeType: 'application/json',
+              responseSchema: assessmentResponseSchema
+            }
+          }),
+          ADJUDICATOR_TIMEOUT_MS,
+          'Adjudicator'
+        );
+        const adjudicatorParsed = parseJsonFromText(adjudicatorResponse.text || '');
+        if (!adjudicatorParsed) {
+          throw new Error('invalid_json');
+        }
+        finalAssessment = adjudicatorParsed;
+        finalNormalized = normalizeAssessmentResults(adjudicatorParsed);
+        finalDecisionSource = 'ADJUDICATOR';
+      } catch {
+        finalDecisionSource = 'HUMAN_REQUIRED';
+      }
+    }
+
+    if (invalidJsonFailure) {
+      finalDecisionSource = 'HUMAN_REQUIRED';
+      reviewTrigger = 'TIMEOUT_FALLBACK';
+      isEscalated = true;
+      difficultyScore = 1;
+    }
+
+    const weightedTotals = finalNormalized.criteriaResults.reduce(
+      (acc, result) => {
+        const criterion = criteriaById.get(result.id);
+        const weight = normalizeWeight(criterion?.weight);
+        acc.weightedSum += result.score * weight;
+        acc.weightTotal += weight;
+        return acc;
+      },
+      { weightedSum: 0, weightTotal: 0 }
+    );
+    const scorePercent = weightedTotals.weightTotal > 0
+      ? weightedTotals.weightedSum / weightedTotals.weightTotal
+      : 0;
+    const score = Math.round(scorePercent * 1000);
+
+    const assessmentNormalized = {
+      formalia: finalAssessment.formalia || fallbackAssessment.formalia,
+      criteria_results: finalNormalized.criteriaResults,
+      pass_fail: finalNormalized.passFail,
+      final_metrics: {
+        score_100k: score,
+        reliability_index: clampFloat(reliabilityIndex, 0, 1)
+      },
+      triage_metadata: {
+        difficulty_score: clampFloat(difficultyScore, 0, 1),
+        review_trigger: reviewTrigger,
+        final_decision_source: finalDecisionSource,
+        is_escalated: isEscalated,
+        evidence_gap_score: evidenceGapScore,
+        disagreement_score: disagreementScore,
+        boundary_score: boundaryScore,
+        self_reflection_score: avgSelfReflection
+      },
+      teacher_insights: finalAssessment.teacher_insights || fallbackAssessment.teacher_insights
     };
 
     const feedbackModel = await resolveTaskModel('feedback');
@@ -2504,13 +2929,20 @@ apiRouter.post('/assessment', async (req, res) => {
       await agentRef.set({ verificationPrefix: minPrefix }, { merge: true });
     }
 
-    const passThreshold = typeof agent.passThreshold === 'number' ? agent.passThreshold : 80000;
-    const passBucket = getScoreBucket(passThreshold);
-    const scoreBucket = getScoreBucket(score);
-    const isPassed = scoreBucket >= passBucket;
+    const passFail = assessmentNormalized.pass_fail || 'U';
+    const isPassed = passFail === 'G';
     const codePrefix = isPassed ? randomPrefixInRange(minPrefix) : randomPrefixBelow(minPrefix);
     const sessionSuffix = Math.floor(Math.random() * 1000);
-    const verificationCode = generateVerificationCode(score, sessionSuffix, codePrefix);
+    let verificationCode = generateVerificationCode(score, sessionSuffix, codePrefix);
+    const shouldUse9999 = hardFailure || invalidJsonFailure;
+    if (shouldUse9999) {
+      verificationCode = '9999';
+    } else if (assessmentNormalized.triage_metadata?.is_escalated) {
+      const numericCode = Number.parseInt(verificationCode, 10);
+      if (Number.isFinite(numericCode)) {
+        verificationCode = String(numericCode * 10);
+      }
+    }
 
     const visibleTo = Array.isArray(agent.visibleTo) ? agent.visibleTo : [agent.ownerUid].filter(Boolean);
     const sessionId = crypto.createHash('sha256').update(accessToken).digest('hex').slice(0, 16);
@@ -2523,10 +2955,22 @@ apiRouter.post('/assessment', async (req, res) => {
       stringency,
       criteria_matrix: criteriaMatrixRaw.length ? criteriaMatrixRaw : criteriaForPrompt,
       insights: assessmentNormalized.teacher_insights,
+      pass_fail: passFail,
+      triage_metadata: assessmentNormalized.triage_metadata,
       visibleTo
     });
 
-    await logAudit('assessment', { agentId, score });
+    await logAudit('assessment', {
+      agentId,
+      score,
+      passFail,
+      triage: assessmentNormalized.triage_metadata,
+      modelA: assessmentModelA,
+      modelB: assessmentModelB,
+      adjudicator: adjudicatorModel,
+      latencyModelA: modelAResponse?.latencyMs,
+      latencyModelB: modelBResponse?.latencyMs
+    });
 
     return res.json({
       assessment: assessmentNormalized,

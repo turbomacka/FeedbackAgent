@@ -146,6 +146,10 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language, onLan
   };
 
   const latestResult = results[0];
+  const passFail = latestResult?.assessment?.pass_fail;
+  const isPassed = passFail === 'G'
+    || (passFail !== 'U'
+      && latestResult?.assessment?.final_metrics?.score_100k >= (agent.passThreshold || 80000));
   const renderMarkdown = (content: string) => {
     return content.split('\n').map((line, i) => {
       if (line.startsWith('###')) return <h3 key={i} className="text-xl font-black text-indigo-950 mt-6 mb-3 border-b border-indigo-100 pb-1">{line.replace('###', '').trim()}</h3>;
@@ -334,8 +338,8 @@ export const StudentView: React.FC<StudentViewProps> = ({ agent, language, onLan
                  <div className="flex items-center gap-6">
                     <div className="flex flex-col">
                       <span className="text-[10px] text-gray-600 font-black uppercase tracking-widest">STATUS</span>
-                      <span className={`font-black text-xl uppercase tracking-tight ${latestResult.assessment.final_metrics.score_100k >= (agent.passThreshold || 80000) ? 'text-emerald-600' : 'text-amber-600'}`}>
-                        {latestResult.assessment.final_metrics.score_100k >= (agent.passThreshold || 80000) ? t('allMet') : t('developing')}
+                      <span className={`font-black text-xl uppercase tracking-tight ${isPassed ? 'text-emerald-600' : 'text-amber-600'}`}>
+                        {isPassed ? t('allMet') : t('developing')}
                       </span>
                     </div>
                  </div>

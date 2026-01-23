@@ -20,6 +20,7 @@ export interface CriterionMatrixItem {
   name: string;
   description: string;
   indicator: string;
+  is_mandatory?: boolean;
   translations?: {
     sv?: { name?: string; description?: string; indicator?: string };
     en?: { name?: string; description?: string; indicator?: string };
@@ -80,12 +81,25 @@ export interface AssessmentJSON {
   criteria_results: {
     id: string;
     met: boolean;
-    score: number; // 0..1
-    evidence: string;
+    score: number; // 0..100
+    evidence_quote: string;
+    self_reflection_score: number; // 0..100
+    evidence_valid?: boolean;
   }[];
+  pass_fail?: 'G' | 'U';
   final_metrics: {
     score_100k: number;
     reliability_index: number;
+  };
+  triage_metadata?: {
+    difficulty_score: number;
+    review_trigger: 'CONSENSUS' | 'DISAGREEMENT' | 'HIGH_UNCERTAINTY' | 'TIMEOUT_FALLBACK';
+    final_decision_source: 'MODELS_AB' | 'ADJUDICATOR' | 'HUMAN_REQUIRED';
+    is_escalated: boolean;
+    evidence_gap_score?: number;
+    disagreement_score?: number;
+    boundary_score?: number;
+    self_reflection_score?: number;
   };
   teacher_insights: {
     common_errors: string[];
@@ -118,6 +132,8 @@ export interface Submission {
     strengths: string[];
     teaching_actions: string[]; 
   };
+  pass_fail?: 'G' | 'U';
+  triage_metadata?: AssessmentJSON['triage_metadata'];
 }
 
 export interface AppState {

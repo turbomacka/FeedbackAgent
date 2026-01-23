@@ -34,10 +34,9 @@ export const generateVerificationPrefix = (seed: string): number => {
   return PREFIX_MIN + (hashSeed(seed) % range);
 };
 
-export const getVerificationMinimum = (prefix: number, passThreshold: number): number => {
+export const getVerificationMinimum = (prefix: number): number => {
   const cleanPrefix = normalizeVerificationPrefix(prefix) ?? PREFIX_MIN;
-  const bucket = Math.min(999, Math.floor(clampNumber(passThreshold, 0, 100000) / SCORE_BUCKET_DIVISOR));
-  return (cleanPrefix * 1_000_000) + (bucket * SCORE_BUCKET_MULTIPLIER);
+  return cleanPrefix * 1_000_000;
 };
 
 export const getVerificationMaximum = (): number => 999_999_999;

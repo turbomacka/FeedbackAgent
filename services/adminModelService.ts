@@ -60,6 +60,7 @@ export interface ModelRoutingConfig {
   embeddings: ModelTaskConfig;
   safeAssessment: ModelTaskConfig;
   pricingCurrency: string;
+  health?: Record<string, { status: 'ok' | 'error'; checkedAt: number; message?: string }>;
 }
 
 export async function getAdminModelConfig(): Promise<{ providers: ModelProvider[]; routing: ModelRoutingConfig; allowlist: string[] }> {

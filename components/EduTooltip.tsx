@@ -41,7 +41,7 @@ export const EduTooltip: React.FC<EduTooltipProps> = ({ text, children, position
       {children}
       {isVisible && coords && createPortal(
         <div
-          className="fixed z-[9999] px-3 py-2 text-xs font-medium text-white bg-gray-900 rounded-lg shadow-xl max-w-[260px] text-center"
+          className="fixed z-[9999] px-3 py-2 text-xs font-medium text-white bg-gray-900 rounded-lg shadow-xl max-w-[280px] text-center whitespace-pre-line"
           style={{
             left: coords.left,
             top: coords.top,
