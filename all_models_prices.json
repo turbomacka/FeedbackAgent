@@ -1,0 +1,239 @@
+{
+  "currency": "USD",
+  "prices": [
+    {
+      "providerId": "openai",
+      "model": "gpt-5.2",
+      "priceInput1M": "1.75",
+      "priceOutput1M": "14.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-5.1",
+      "priceInput1M": "1.25",
+      "priceOutput1M": "10.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-5",
+      "priceInput1M": "1.25",
+      "priceOutput1M": "10.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-5-mini",
+      "priceInput1M": "0.25",
+      "priceOutput1M": "2.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-5-nano",
+      "priceInput1M": "0.05",
+      "priceOutput1M": "0.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4.1",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "8.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4.1-mini",
+      "priceInput1M": "0.40",
+      "priceOutput1M": "1.60"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4.1-nano",
+      "priceInput1M": "0.10",
+      "priceOutput1M": "0.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4o",
+      "priceInput1M": "2.50",
+      "priceOutput1M": "10.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4o-mini",
+      "priceInput1M": "0.15",
+      "priceOutput1M": "0.60"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-realtime",
+      "priceInput1M": "4.00",
+      "priceOutput1M": "16.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-realtime-mini",
+      "priceInput1M": "0.60",
+      "priceOutput1M": "2.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4o realtime preview",
+      "priceInput1M": "5.00",
+      "priceOutput1M": "20.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "gpt-4o-mini realtime preview",
+      "priceInput1M": "0.60",
+      "priceOutput1M": "2.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "o1",
+      "priceInput1M": "15.00",
+      "priceOutput1M": "60.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "o3",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "8.00"
+    },
+    {
+      "providerId": "openai",
+      "model": "o3-mini",
+      "priceInput1M": "1.10",
+      "priceOutput1M": "4.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "o4-mini",
+      "priceInput1M": "1.10",
+      "priceOutput1M": "4.40"
+    },
+    {
+      "providerId": "openai",
+      "model": "o1-mini",
+      "priceInput1M": "1.10",
+      "priceOutput1M": "4.40"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-3-flash-preview",
+      "priceInput1M": "0.500",
+      "priceOutput1M": "3.00"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-pro (<=200k)",
+      "priceInput1M": "1.25",
+      "priceOutput1M": "10.00"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-pro (>200k)",
+      "priceInput1M": "2.50",
+      "priceOutput1M": "15.00"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-flash",
+      "priceInput1M": "0.300",
+      "priceOutput1M": "2.50"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-flash-preview",
+      "priceInput1M": "0.300",
+      "priceOutput1M": "2.50"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-flash-lite",
+      "priceInput1M": "0.100",
+      "priceOutput1M": "0.40"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.5-flash-lite-preview",
+      "priceInput1M": "0.100",
+      "priceOutput1M": "0.40"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.0-flash",
+      "priceInput1M": "0.100",
+      "priceOutput1M": "0.40"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-2.0-flash-lite",
+      "priceInput1M": "0.075",
+      "priceOutput1M": "0.30"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-3-pro (<=200k)",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "12.00"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-3-pro (>200k)",
+      "priceInput1M": "4.00",
+      "priceOutput1M": "18.00"
+    },
+    {
+      "providerId": "gemini-api",
+      "model": "gemini-embedding-001",
+      "priceInput1M": "0.150",
+      "priceOutput1M": "0.00"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "mistral-small-latest",
+      "priceInput1M": "0.10",
+      "priceOutput1M": "0.30"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "mistral-medium-3",
+      "priceInput1M": "0.40",
+      "priceOutput1M": "2.00"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "mistral-large",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "6.00"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "pixtral-large",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "6.00"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "magistral-medium",
+      "priceInput1M": "2.00",
+      "priceOutput1M": "5.00"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "codestral",
+      "priceInput1M": "0.30",
+      "priceOutput1M": "0.90"
+    },
+    {
+      "providerId": "mistral-ai",
+      "model": "devstral",
+      "priceInput1M": "0.10",
+      "priceOutput1M": "0.30"
+    },
+    {
+      "providerId": "vertex-ai",
+      "model": "text-embedding-004",
+      "priceInput1M": "0.025",
+      "priceOutput1M": "0.00"
+    }
+  ]
+}

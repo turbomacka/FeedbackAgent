@@ -25,9 +25,6 @@ const FUNCTION_SECRETS = [
   'DOC_AI_LOCATION',
   'VERTEX_LOCATION',
   'EMBEDDING_LOCATION',
-  'VECTOR_INDEX_ID',
-  'VECTOR_INDEX_ENDPOINT_ID',
-  'VECTOR_DEPLOYED_INDEX_ID',
   'EMBEDDING_MODEL'
 ];
 const firebaseConfig = process.env.FIREBASE_CONFIG ? JSON.parse(process.env.FIREBASE_CONFIG) : {};
@@ -41,9 +38,6 @@ const DOC_AI_LOCATION = process.env.DOC_AI_LOCATION || 'eu';
 const DOC_AI_PROCESSOR_ID = process.env.DOC_AI_PROCESSOR_ID || '';
 const VERTEX_LOCATION = process.env.VERTEX_LOCATION || REGION;
 const EMBEDDING_LOCATION = process.env.EMBEDDING_LOCATION || VERTEX_LOCATION;
-const VECTOR_INDEX_ID = process.env.VECTOR_INDEX_ID || '';
-const VECTOR_INDEX_ENDPOINT_ID = process.env.VECTOR_INDEX_ENDPOINT_ID || '';
-const VECTOR_DEPLOYED_INDEX_ID = process.env.VECTOR_DEPLOYED_INDEX_ID || '';
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || 'text-embedding-004';
 const EMBEDDING_TASK_TYPE = process.env.EMBEDDING_TASK_TYPE || '';
 const EMBEDDING_OUTPUT_DIM = Number.parseInt(process.env.EMBEDDING_OUTPUT_DIM || '', 10);
@@ -54,9 +48,12 @@ const DOC_AI_PAGE_LIMIT = 30;
 const ACCESS_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const TOS_VERSION = 'v1-2026-01';
 const PROMO_CODE_LENGTH = 8;
+const USAGE_DAILY_COLLECTION = 'usageDaily';
+const USAGE_MODELS_SUBCOLLECTION = 'usageModels';
 
 const db = admin.firestore();
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
+const vertexAiClients = new Map<string, GoogleGenAI>();
+const geminiApiClients = new Map<string, GoogleGenAI>();
 const storage = new Storage();
 const visionClient = new ImageAnnotatorClient();
 const documentAiClient = new DocumentProcessorServiceClient({
@@ -64,12 +61,6 @@ const documentAiClient = new DocumentProcessorServiceClient({
 });
 const embeddingClient = new aiplatform.v1.PredictionServiceClient({
   apiEndpoint: `${EMBEDDING_LOCATION}-aiplatform.googleapis.com`,
-});
-const indexClient = new aiplatform.v1.IndexServiceClient({
-  apiEndpoint: `${VERTEX_LOCATION}-aiplatform.googleapis.com`,
-});
-const matchClient = new aiplatform.v1.MatchServiceClient({
-  apiEndpoint: `${VERTEX_LOCATION}-aiplatform.googleapis.com`,
 });
 
 type ModelProviderType = 'native-google' | 'openai-compatible';
@@ -107,6 +98,9 @@ interface ModelRoutingConfig {
   embeddings: ModelTaskConfig;
   safeAssessment: ModelTaskConfig;
   pricingCurrency: string;
+  priceBook?: Record<string, { priceInput1M?: string; priceOutput1M?: string }>;
+  priceImportMeta?: { fileName: string; importedAt: number };
+  triageEnabled?: boolean;
   updatedAt?: admin.firestore.FieldValue | admin.firestore.Timestamp | null;
   health?: Record<string, { status: 'ok' | 'error'; checkedAt: number; message?: string }>;
 }
@@ -131,19 +125,32 @@ const DEFAULT_MODEL_ROUTING: ModelRoutingConfig = {
   tasks: DEFAULT_TASK_MODELS,
   embeddings: { providerId: 'vertex-embeddings', model: EMBEDDING_MODEL },
   safeAssessment: { providerId: 'gemini', model: 'gemini-3-flash-preview' },
-  pricingCurrency: 'USD'
+  pricingCurrency: 'USD',
+  priceBook: {},
+  triageEnabled: true
 };
 
 const DEFAULT_PROVIDERS: Record<string, ModelProviderDoc> = {
   gemini: {
     id: 'gemini',
+    label: 'Gemini (Vertex AI)',
+    type: 'native-google',
+    enabled: true,
+    baseUrl: `https://${VERTEX_LOCATION}-aiplatform.googleapis.com`,
+    location: VERTEX_LOCATION,
+    capabilities: { chat: true, embeddings: false, jsonMode: true },
+    manualModelIds: ['gemini-3-flash-preview', 'gemini-3-pro-preview'],
+    syncedModels: []
+  },
+  'gemini-api': {
+    id: 'gemini-api',
     label: 'Gemini API',
     type: 'native-google',
     enabled: true,
     baseUrl: 'https://generativelanguage.googleapis.com',
     secretName: 'GEMINI_API_KEY',
     capabilities: { chat: true, embeddings: false, jsonMode: true },
-    manualModelIds: ['gemini-3-flash-preview', 'gemini-3-pro-preview'],
+    manualModelIds: [],
     syncedModels: []
   },
   'vertex-embeddings': {
@@ -191,17 +198,38 @@ let modelRoutingCache: { value: ModelRoutingConfig; fetchedAt: number } | null =
 let providersCache: { value: ModelProviderDoc[]; fetchedAt: number } | null = null;
 let allowlistCache: { value: string[]; fetchedAt: number } | null = null;
 
-if (!process.env.GEMINI_API_KEY) {
-  logger.warn('GEMINI_API_KEY is not set. Gemini requests will fail.');
+function getVertexAiClient(location: string) {
+  const resolvedLocation = location || VERTEX_LOCATION;
+  const cached = vertexAiClients.get(resolvedLocation);
+  if (cached) return cached;
+  if (!PROJECT_ID) {
+    throw new Error('PROJECT_ID is not configured.');
+  }
+  const client = new GoogleGenAI({
+    vertexai: true,
+    project: PROJECT_ID,
+    location: resolvedLocation
+  });
+  vertexAiClients.set(resolvedLocation, client);
+  return client;
 }
+
+function getGeminiApiClient(apiKey: string) {
+  if (!apiKey) {
+    throw new Error('Gemini API key is missing.');
+  }
+  const cached = geminiApiClients.get(apiKey);
+  if (cached) return cached;
+  const client = new GoogleGenAI({ apiKey });
+  geminiApiClients.set(apiKey, client);
+  return client;
+}
+
 if (!PROJECT_ID) {
   logger.warn('PROJECT_ID is not set. RAG services may fail.');
 }
 if (!DOC_AI_PROCESSOR_ID) {
   logger.warn('DOC_AI_PROCESSOR_ID is not set. PDF/image extraction will be limited.');
-}
-if (!VECTOR_INDEX_ID || !VECTOR_INDEX_ENDPOINT_ID || !VECTOR_DEPLOYED_INDEX_ID) {
-  logger.warn('Vector Search configuration is missing. RAG retrieval will fallback to raw documents.');
 }
 
 const STRINGENCY_MODULES = {
@@ -417,12 +445,6 @@ ${SUPPORT_KB}`;
 const app = express();
 app.use(cors({ origin: true }));
 app.use(express.json({ limit: '2mb' }));
-app.use((req, res, next) => {
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).send('GEMINI_API_KEY is not configured.');
-  }
-  return next();
-});
 const apiRouter = express.Router();
 
 const TEXT_MIME_TYPES = new Set([
@@ -655,6 +677,90 @@ async function logAudit(event: string, details: Record<string, unknown>) {
   });
 }
 
+const formatUsageDate = (date = new Date()) => {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+};
+
+const parsePriceValue = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return 0;
+  const cleaned = value.replace(/[^0-9.,-]/g, '').replace(',', '.');
+  const parsed = Number.parseFloat(cleaned);
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+
+const normalizeUsageDate = (value: unknown, fallback: string) => {
+  const raw = String(value || '').trim();
+  if (/^\d{8}$/.test(raw)) return raw;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw.replace(/-/g, '');
+  return fallback;
+};
+
+const parseUsageDateKey = (value: string) => {
+  if (!/^\d{8}$/.test(value)) return null;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(4, 6));
+  const day = Number(value.slice(6, 8));
+  if (!Number.isFinite(year) || !Number.isFinite(month) || !Number.isFinite(day)) return null;
+  return new Date(Date.UTC(year, month - 1, day));
+};
+
+const safeNumber = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+};
+
+async function logUsageEvent(params: {
+  task?: string;
+  providerId: string;
+  model: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  latencyMs?: number;
+  ok: boolean;
+}) {
+  const { task, providerId, model, inputTokens, outputTokens, latencyMs, ok } = params;
+  if (!task || !providerId || !model) return;
+  const dateKey = formatUsageDate();
+  const docId = encodeURIComponent(`${task}|${providerId}|${model}`);
+  const ref = db
+    .collection(USAGE_DAILY_COLLECTION)
+    .doc(dateKey)
+    .collection(USAGE_MODELS_SUBCOLLECTION)
+    .doc(docId);
+
+  const input = Math.max(0, safeNumber(inputTokens));
+  const output = Math.max(0, safeNumber(outputTokens));
+  const latency = Math.max(0, safeNumber(latencyMs));
+
+  try {
+    await ref.set(
+      {
+        date: dateKey,
+        task,
+        providerId,
+        model,
+        requestCount: admin.firestore.FieldValue.increment(1),
+        inputTokens: admin.firestore.FieldValue.increment(input),
+        outputTokens: admin.firestore.FieldValue.increment(output),
+        errorCount: admin.firestore.FieldValue.increment(ok ? 0 : 1),
+        latencyMsTotal: admin.firestore.FieldValue.increment(latency),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    logger.warn('Usage logging failed.', error);
+  }
+}
+
 async function requireAuth(req: express.Request, res: express.Response) {
   const header = req.headers.authorization || '';
   if (!header.startsWith('Bearer ')) {
@@ -697,11 +803,13 @@ async function ensureDefaultProviders() {
       hasChanges = true;
     } else {
       const data = snap.docs.find(docSnap => docSnap.id === provider.id)?.data() || {};
+      const requiresSecret = Boolean(provider.secretName);
+      const requiresBaseUrl = Boolean(provider.baseUrl);
       const needsUpdate =
         !data.type ||
         !data.capabilities ||
-        !data.secretName ||
-        !data.baseUrl ||
+        (requiresSecret && !data.secretName) ||
+        (requiresBaseUrl && !data.baseUrl) ||
         !Array.isArray(data.manualModelIds) ||
         !Array.isArray(data.syncedModels);
       if (needsUpdate) {
@@ -841,6 +949,7 @@ async function testChatModel(config: ModelTaskConfig) {
     providerId: config.providerId,
     model: config.model,
     contents: { parts: [{ text: 'Ping. Return OK.' }] },
+    task: 'healthCheck',
     config: { systemInstruction: 'Return OK.', temperature: 0 }
   });
 }
@@ -903,6 +1012,7 @@ async function testEmbeddingModel(config: ModelTaskConfig) {
 async function runRoutingHealthChecks(routing: ModelRoutingConfig) {
   const now = Date.now();
   const health: Record<string, { status: 'ok' | 'error'; checkedAt: number; message?: string }> = {};
+  const triageEnabled = routing.triageEnabled !== false;
 
   const check = async (key: string, fn: () => Promise<void>) => {
     try {
@@ -915,6 +1025,9 @@ async function runRoutingHealthChecks(routing: ModelRoutingConfig) {
 
   const taskEntries = Object.entries(routing.tasks || {});
   for (const [task, config] of taskEntries) {
+    if (!triageEnabled && (task === 'assessmentB' || task === 'adjudicator')) {
+      continue;
+    }
     await check(task, async () => testChatModel(config));
   }
   await check('embeddings', async () => testEmbeddingModel(routing.embeddings));
@@ -958,13 +1071,33 @@ function mergeRoutingDefaults(routing?: Partial<ModelRoutingConfig> | null): Mod
       }
     : { ...DEFAULT_MODEL_ROUTING.safeAssessment };
 
+  const safePriceBook: Record<string, { priceInput1M?: string; priceOutput1M?: string }> = {};
+  if (routing?.priceBook && typeof routing.priceBook === 'object') {
+    Object.entries(routing.priceBook).forEach(([key, value]) => {
+      if (!key) return;
+      const entry = value as { priceInput1M?: unknown; priceOutput1M?: unknown };
+      safePriceBook[key] = {
+        priceInput1M: typeof entry?.priceInput1M === 'string' ? entry.priceInput1M : entry?.priceInput1M?.toString?.() || '',
+        priceOutput1M: typeof entry?.priceOutput1M === 'string' ? entry.priceOutput1M : entry?.priceOutput1M?.toString?.() || ''
+      };
+    });
+  }
+
+  const priceImportMeta = routing?.priceImportMeta;
+  const safePriceImportMeta = priceImportMeta && typeof priceImportMeta.fileName === 'string' && typeof priceImportMeta.importedAt === 'number'
+    ? { fileName: priceImportMeta.fileName, importedAt: priceImportMeta.importedAt }
+    : null;
+
   return {
     tasks: safeTasks,
     embeddings: safeEmbeddings,
     safeAssessment,
     pricingCurrency: typeof routing?.pricingCurrency === 'string' && routing.pricingCurrency.trim()
       ? routing.pricingCurrency.trim()
-      : DEFAULT_MODEL_ROUTING.pricingCurrency
+      : DEFAULT_MODEL_ROUTING.pricingCurrency,
+    priceBook: safePriceBook,
+    ...(safePriceImportMeta ? { priceImportMeta: safePriceImportMeta } : {}),
+    triageEnabled: routing?.triageEnabled === false ? false : true
   };
 }
 
@@ -988,6 +1121,9 @@ async function getModelRouting(force = false): Promise<ModelRoutingConfig> {
 
 async function resolveTaskModel(task: string): Promise<ModelTaskConfig> {
   const routing = await getModelRouting();
+  if (task === 'safeAssessment') {
+    return routing.safeAssessment;
+  }
   const config = routing.tasks[task] || DEFAULT_TASK_MODELS[task] || DEFAULT_MODEL_ROUTING.tasks.assessment;
   const providers = await getProviders();
   const provider = providers.find(item => item.id === config.providerId);
@@ -1034,10 +1170,73 @@ function extractTextFromContents(contents: any): string {
   return JSON.stringify(contents);
 }
 
+function injectSystemInstruction(contents: any, systemInstruction: string) {
+  const systemPart = { text: `SYSTEM INSTRUCTION:\n${systemInstruction}` };
+  if (!contents) {
+    return { parts: [systemPart] };
+  }
+  if (typeof contents === 'string') {
+    return { parts: [systemPart, { text: contents }] };
+  }
+  if (Array.isArray(contents?.parts)) {
+    return { ...contents, parts: [systemPart, ...contents.parts] };
+  }
+  if (typeof contents?.text === 'string') {
+    return { parts: [systemPart, { text: contents.text }] };
+  }
+  if (Array.isArray(contents)) {
+    const parts = contents
+      .map(item => extractTextFromContents(item))
+      .filter(Boolean)
+      .map(text => ({ text }));
+    return { parts: [systemPart, ...parts] };
+  }
+  return { parts: [systemPart, { text: JSON.stringify(contents) }] };
+}
+
+function normalizeGeminiApiContents(contents: any, systemInstruction?: string) {
+  const base = systemInstruction ? injectSystemInstruction(contents, systemInstruction) : contents;
+  if (Array.isArray(base)) {
+    const hasRoles = base.every(item => item && typeof item === 'object' && 'role' in item);
+    if (hasRoles) return base;
+    const parts = base
+      .map(item => extractTextFromContents(item))
+      .filter(Boolean)
+      .map(text => ({ text }));
+    return [{ role: 'user', parts }];
+  }
+  if (base && typeof base === 'object' && Array.isArray(base.parts)) {
+    if ('role' in base) return [base];
+    return [{ role: 'user', parts: base.parts }];
+  }
+  const text = extractTextFromContents(base);
+  return [{ role: 'user', parts: [{ text: text || '' }] }];
+}
+
+function normalizeVertexContents(contents: any, systemInstruction?: string) {
+  const base = systemInstruction ? injectSystemInstruction(contents, systemInstruction) : contents;
+  if (Array.isArray(base)) {
+    const hasRoles = base.every(item => item && typeof item === 'object' && 'role' in item);
+    if (hasRoles) return base;
+    const parts = base
+      .map(item => extractTextFromContents(item))
+      .filter(Boolean)
+      .map(text => ({ text }));
+    return [{ role: 'user', parts }];
+  }
+  if (base && typeof base === 'object' && Array.isArray(base.parts)) {
+    if ('role' in base) return [base];
+    return [{ role: 'user', parts: base.parts }];
+  }
+  const text = extractTextFromContents(base);
+  return [{ role: 'user', parts: [{ text: text || '' }] }];
+}
+
 async function generateWithProvider(params: {
   providerId: string;
   model: string;
   contents: any;
+  task?: string;
   config?: {
     systemInstruction?: string;
     responseMimeType?: string;
@@ -1045,7 +1244,8 @@ async function generateWithProvider(params: {
     temperature?: number;
   };
 }) {
-  const { providerId, model, contents, config } = params;
+  const { providerId, model, contents, config, task } = params;
+  const startedAt = Date.now();
   const providers = await getProviders();
   const provider = providers.find(item => item.id === providerId);
   if (!provider || !provider.enabled) {
@@ -1053,76 +1253,143 @@ async function generateWithProvider(params: {
   }
 
   if (provider.type === 'openai-compatible') {
-    const secretName = provider.secretName || 'OPENAI_API_KEY';
-    const apiKey = process.env[secretName] || '';
-    if (!apiKey) {
-      throw new Error(`${secretName} is not configured.`);
-    }
-    const baseUrl = await assertAllowedBaseUrl(provider.baseUrl || '');
-    const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
-    if (config?.systemInstruction) {
-      messages.push({ role: 'system', content: config.systemInstruction });
-    }
-    const userText = extractTextFromContents(contents);
-    if (userText) {
-      messages.push({ role: 'user', content: userText });
-    }
-    const body: Record<string, unknown> = {
-      model,
-      messages
-    };
-    if (typeof config?.temperature === 'number') {
-      const isO3 = /^o3/i.test(model);
-      if (!(isO3 && config.temperature === 0)) {
-        body.temperature = config.temperature;
+    try {
+      const secretName = provider.secretName || 'OPENAI_API_KEY';
+      const apiKey = process.env[secretName] || '';
+      if (!apiKey) {
+        throw new Error(`${secretName} is not configured.`);
       }
+      const baseUrl = await assertAllowedBaseUrl(provider.baseUrl || '');
+      const messages: Array<{ role: 'system' | 'user'; content: string }> = [];
+      if (config?.systemInstruction) {
+        messages.push({ role: 'system', content: config.systemInstruction });
+      }
+      const userText = extractTextFromContents(contents);
+      if (userText) {
+        messages.push({ role: 'user', content: userText });
+      }
+      const body: Record<string, unknown> = {
+        model,
+        messages
+      };
+      if (typeof config?.temperature === 'number') {
+        const isNoTempModel = /^o[0-9]/i.test(model);
+        if (!isNoTempModel && config.temperature > 0) {
+          body.temperature = config.temperature;
+        }
+      }
+      if (provider.capabilities?.jsonMode && config?.responseMimeType === 'application/json') {
+        body.response_format = { type: 'json_object' };
+      }
+      const response = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify(body)
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      const payload = await response.json();
+      const text = payload?.choices?.[0]?.message?.content || '';
+      const inputTokens = safeNumber(payload?.usage?.prompt_tokens);
+      const outputTokens = safeNumber(payload?.usage?.completion_tokens);
+      await logUsageEvent({
+        task,
+        providerId,
+        model,
+        inputTokens,
+        outputTokens,
+        latencyMs: Date.now() - startedAt,
+        ok: true
+      });
+      return { text };
+    } catch (error) {
+      await logUsageEvent({
+        task,
+        providerId,
+        model,
+        inputTokens: 0,
+        outputTokens: 0,
+        latencyMs: Date.now() - startedAt,
+        ok: false
+      });
+      throw error;
     }
-    if (provider.capabilities?.jsonMode && config?.responseMimeType === 'application/json') {
-      body.response_format = { type: 'json_object' };
-    }
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`
-      },
-      body: JSON.stringify(body)
+  }
+
+  const secretName = provider.secretName || '';
+  const apiKey = secretName ? process.env[secretName] || '' : '';
+  const location = provider.location || VERTEX_LOCATION;
+  const forceVertex = provider.id === 'gemini';
+  const preferVertex = forceVertex || Boolean(provider.location) || (provider.baseUrl || '').includes('aiplatform.googleapis.com');
+  const useApiKey = !preferVertex && Boolean(apiKey);
+  const geminiClient = useApiKey ? getGeminiApiClient(apiKey) : getVertexAiClient(location);
+  const useVertexSystemHack = !useApiKey && Boolean(config?.systemInstruction);
+  const vertexContents = useVertexSystemHack && config?.systemInstruction
+    ? injectSystemInstruction(contents, config.systemInstruction)
+    : contents;
+  const vertexConfig = useVertexSystemHack
+    ? { ...config, systemInstruction: undefined }
+    : config;
+  const vertexContentsNormalized = normalizeVertexContents(vertexContents);
+  const apiKeyContents = useApiKey
+    ? normalizeGeminiApiContents(contents, config?.systemInstruction)
+    : contents;
+  const apiKeyConfig = useApiKey && config?.systemInstruction
+    ? { ...config, systemInstruction: undefined }
+    : config;
+
+  try {
+    const response = await geminiClient.models.generateContent({
+      model,
+      contents: useApiKey ? apiKeyContents : vertexContentsNormalized,
+      config: useApiKey ? apiKeyConfig : vertexConfig
     });
+    const usage = (response as any)?.usageMetadata || {};
+    const inputTokens = safeNumber(usage?.promptTokenCount);
+    const outputTokens = safeNumber(usage?.candidatesTokenCount);
+    await logUsageEvent({
+      task,
+      providerId,
+      model,
+      inputTokens,
+      outputTokens,
+      latencyMs: Date.now() - startedAt,
+      ok: true
+    });
+    return response;
+  } catch (error) {
+    await logUsageEvent({
+      task,
+      providerId,
+      model,
+      inputTokens: 0,
+      outputTokens: 0,
+      latencyMs: Date.now() - startedAt,
+      ok: false
+    });
+    throw error;
+  }
+}
+
+async function listGeminiModels(provider: ModelProviderDoc) {
+  const secretName = provider.secretName || '';
+  const apiKey = secretName ? process.env[secretName] || '' : '';
+  const forceVertex = provider.id === 'gemini';
+  const preferVertex = forceVertex || Boolean(provider.location) || (provider.baseUrl || '').includes('aiplatform.googleapis.com');
+  if (!preferVertex && apiKey) {
+    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
     if (!response.ok) {
       throw new Error(await response.text());
     }
     const payload = await response.json();
-    const text = payload?.choices?.[0]?.message?.content || '';
-    return { text };
+    const items = Array.isArray(payload?.models) ? payload.models : [];
+    return normalizeModelList(items.map((model: any) => ({ id: model.name })));
   }
-
-  const secretName = provider.secretName || 'GEMINI_API_KEY';
-  const apiKey = process.env[secretName] || '';
-  const geminiClient = secretName === 'GEMINI_API_KEY' ? ai : new GoogleGenAI({ apiKey });
-  if (!apiKey) {
-    throw new Error(`${secretName} is not configured.`);
-  }
-
-  return geminiClient.models.generateContent({
-    model,
-    contents,
-    config
-  });
-}
-
-async function listGeminiModels(provider: ModelProviderDoc) {
-  const secretName = provider.secretName || 'GEMINI_API_KEY';
-  const apiKey = process.env[secretName] || '';
-  if (!apiKey) {
-    throw new Error(`${secretName} is not configured.`);
-  }
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  const payload = await response.json();
-  const items = Array.isArray(payload?.models) ? payload.models : [];
-  return normalizeModelList(items.map((model: any) => ({ id: model.name })));
+  return listVertexChatModels(provider);
 }
 
 async function listOpenAiCompatibleModels(provider: ModelProviderDoc) {
@@ -1148,7 +1415,7 @@ async function listVertexEmbeddingModels(provider: ModelProviderDoc) {
     throw new Error('PROJECT_ID is not configured.');
   }
   const location = provider.location || EMBEDDING_LOCATION;
-  const parent = `projects/${PROJECT_ID}/locations/${location}/publishers/google`;
+  const parent = 'publishers/google';
   const models: Array<{ id: string; label: string }> = [];
   const client = new aiplatform.v1beta1.ModelGardenServiceClient({
     apiEndpoint: `${location}-aiplatform.googleapis.com`,
@@ -1162,6 +1429,34 @@ async function listVertexEmbeddingModels(provider: ModelProviderDoc) {
     models.push({ id, label: id });
   }
   return models.length ? models : [{ id: EMBEDDING_MODEL, label: EMBEDDING_MODEL }];
+}
+
+async function listVertexChatModels(provider: ModelProviderDoc) {
+  if (!PROJECT_ID) {
+    throw new Error('PROJECT_ID is not configured.');
+  }
+  const location = provider.location || VERTEX_LOCATION;
+  const parent = 'publishers/google';
+  const models: Array<{ id: string; label: string }> = [];
+  const client = new aiplatform.v1beta1.ModelGardenServiceClient({
+    apiEndpoint: `${location}-aiplatform.googleapis.com`,
+  });
+  for await (const publisherModel of client.listPublisherModelsAsync({ parent })) {
+    const name = publisherModel?.name || '';
+    if (!name) continue;
+    const id = name.replace(/^publishers\/[^/]+\/models\//, '');
+    if (!id) continue;
+    if (!id.toLowerCase().includes('gemini')) continue;
+    models.push({ id, label: id });
+  }
+  if (models.length) {
+    return normalizeModelList(models);
+  }
+  const manual = provider.manualModelIds || [];
+  if (manual.length) {
+    return normalizeModelList(manual.map(id => ({ id })));
+  }
+  return normalizeModelList(DEFAULT_PROVIDERS.gemini?.manualModelIds?.map(id => ({ id })) || []);
 }
 
 async function getAccessSession(agentId: string, accessToken: string) {
@@ -1394,49 +1689,77 @@ function estimateTokens(text: string) {
   return Math.max(1, Math.ceil(text.length / 3));
 }
 
-async function embedTexts(texts: string[]) {
+async function embedTexts(texts: string[], task = 'embeddings') {
   const embeddingConfig = await resolveEmbeddingModel();
   const providers = await getProviders();
   const provider = providers.find(item => item.id === embeddingConfig.providerId);
+  const startedAt = Date.now();
+  const tokenEstimateTotal = texts.reduce((sum, text) => sum + estimateTokens(text), 0);
 
   if (provider?.type === 'openai-compatible') {
-    if (!provider.capabilities?.embeddings) {
-      throw new Error('Selected provider does not support embeddings.');
-    }
-    const secretName = provider.secretName || 'OPENAI_API_KEY';
-    const apiKey = process.env[secretName] || '';
-    if (!apiKey) {
-      throw new Error(`${secretName} is not configured.`);
-    }
-    const baseUrl = await assertAllowedBaseUrl(provider.baseUrl || '');
-    const cleaned = texts.map(text => text.trim()).filter(Boolean);
-    if (cleaned.length === 0) return [];
-    const vectors: number[][] = [];
-    for (let i = 0; i < cleaned.length; i += EMBEDDING_BATCH_SIZE) {
-      const batch = cleaned.slice(i, i + EMBEDDING_BATCH_SIZE);
-      const response = await fetch(`${baseUrl}/embeddings`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({
-          model: embeddingConfig.model,
-          input: batch
-        })
-      });
-      if (!response.ok) {
-        throw new Error(await response.text());
+    try {
+      if (!provider.capabilities?.embeddings) {
+        throw new Error('Selected provider does not support embeddings.');
       }
-      const payload = await response.json();
-      const data = Array.isArray(payload?.data) ? payload.data : [];
-      data.forEach((item: any) => {
-        if (Array.isArray(item?.embedding)) {
-          vectors.push(item.embedding as number[]);
+      const secretName = provider.secretName || 'OPENAI_API_KEY';
+      const apiKey = process.env[secretName] || '';
+      if (!apiKey) {
+        throw new Error(`${secretName} is not configured.`);
+      }
+      const baseUrl = await assertAllowedBaseUrl(provider.baseUrl || '');
+      const cleaned = texts.map(text => text.trim()).filter(Boolean);
+      if (cleaned.length === 0) return [];
+      const vectors: number[][] = [];
+      let inputTokens = 0;
+      for (let i = 0; i < cleaned.length; i += EMBEDDING_BATCH_SIZE) {
+        const batch = cleaned.slice(i, i + EMBEDDING_BATCH_SIZE);
+        const response = await fetch(`${baseUrl}/embeddings`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: embeddingConfig.model,
+            input: batch
+          })
+        });
+        if (!response.ok) {
+          throw new Error(await response.text());
         }
+        const payload = await response.json();
+        const usageTokens = safeNumber(payload?.usage?.prompt_tokens)
+          || safeNumber(payload?.usage?.total_tokens);
+        inputTokens += usageTokens;
+        const data = Array.isArray(payload?.data) ? payload.data : [];
+        data.forEach((item: any) => {
+          if (Array.isArray(item?.embedding)) {
+            vectors.push(item.embedding as number[]);
+          }
+        });
+      }
+      await logUsageEvent({
+        task,
+        providerId: embeddingConfig.providerId,
+        model: embeddingConfig.model,
+        inputTokens: inputTokens || tokenEstimateTotal,
+        outputTokens: 0,
+        latencyMs: Date.now() - startedAt,
+        ok: true
       });
+      return vectors;
+    } catch (error) {
+      await logUsageEvent({
+        task,
+        providerId: embeddingConfig.providerId,
+        model: embeddingConfig.model,
+        inputTokens: tokenEstimateTotal,
+        outputTokens: 0,
+        latencyMs: Date.now() - startedAt,
+        ok: false
+      });
+      throw error;
     }
-    return vectors;
   }
 
   const location = provider?.location || EMBEDDING_LOCATION;
@@ -1499,64 +1822,74 @@ async function embedTexts(texts: string[]) {
     ? embeddingClient
     : new aiplatform.v1.PredictionServiceClient({ apiEndpoint: `${location}-aiplatform.googleapis.com` });
 
-  for (const batch of batches) {
-    const instances = batch.map(text => aiplatform.helpers.toValue({ content: text }));
-    try {
-      const [response] = await (embeddingClientForRegion as any).predict({ endpoint, instances, parameters } as any);
-      const predictions = response?.predictions || [];
-      for (const prediction of predictions) {
-        vectors.push(extractEmbeddingValues(prediction));
+  try {
+    for (const batch of batches) {
+      const instances = batch.map(text => aiplatform.helpers.toValue({ content: text }));
+      try {
+        const [response] = await (embeddingClientForRegion as any).predict({ endpoint, instances, parameters } as any);
+        const predictions = response?.predictions || [];
+        for (const prediction of predictions) {
+          vectors.push(extractEmbeddingValues(prediction));
+        }
+      } catch (error: any) {
+        const message = error?.message || 'Request contains an invalid argument.';
+        if (/input token count/i.test(message) && /supports up to/i.test(message)) {
+          const match = message.match(/input token count is (\d+).*supports up to (\d+)/i);
+          const tokenCount = match ? Number(match[1]) : undefined;
+          const tokenLimit = match ? Number(match[2]) : undefined;
+          const tokenError: any = new Error(message);
+          tokenError.code = 'TOKEN_LIMIT';
+          tokenError.tokenCount = tokenCount;
+          tokenError.tokenLimit = tokenLimit;
+          throw tokenError;
+        }
+        throw new Error(`Vertex AI embedding failed. Details: ${message}. Endpoint: ${endpoint}`);
       }
-    } catch (error: any) {
-      const message = error?.message || 'Request contains an invalid argument.';
-      if (/input token count/i.test(message) && /supports up to/i.test(message)) {
-        const match = message.match(/input token count is (\d+).*supports up to (\d+)/i);
-        const tokenCount = match ? Number(match[1]) : undefined;
-        const tokenLimit = match ? Number(match[2]) : undefined;
-        const tokenError: any = new Error(message);
-        tokenError.code = 'TOKEN_LIMIT';
-        tokenError.tokenCount = tokenCount;
-        tokenError.tokenLimit = tokenLimit;
-        throw tokenError;
-      }
-      throw new Error(`Vertex AI embedding failed. Details: ${message}. Endpoint: ${endpoint}`);
     }
-  }
 
-  return vectors;
+    await logUsageEvent({
+      task,
+      providerId: embeddingConfig.providerId,
+      model: embeddingConfig.model,
+      inputTokens: tokenEstimateTotal,
+      outputTokens: 0,
+      latencyMs: Date.now() - startedAt,
+      ok: true
+    });
+    return vectors;
+  } catch (error) {
+    await logUsageEvent({
+      task,
+      providerId: embeddingConfig.providerId,
+      model: embeddingConfig.model,
+      inputTokens: tokenEstimateTotal,
+      outputTokens: 0,
+      latencyMs: Date.now() - startedAt,
+      ok: false
+    });
+    throw error;
+  }
 }
 
-async function upsertDatapoints(agentId: string, materialId: string, vectors: number[][]) {
-  if (!VECTOR_INDEX_ID || !PROJECT_ID) return;
-  const index = `projects/${PROJECT_ID}/locations/${VERTEX_LOCATION}/indexes/${VECTOR_INDEX_ID}`;
-  const datapoints = vectors.map((vector, idx) => ({
-    datapointId: `${materialId}-${idx}`,
-    featureVector: vector,
-    restricts: [
-      { namespace: 'agentId', allowList: [agentId] }
-    ]
-  }));
-
-  for (let i = 0; i < datapoints.length; i += 50) {
-    const slice = datapoints.slice(i, i + 50);
-    await indexClient.upsertDatapoints({ index, datapoints: slice });
-  }
-}
-
-async function writeChunks(agentId: string, materialId: string, chunks: string[]) {
+async function writeChunks(agentId: string, materialId: string, chunks: string[], embeddings?: number[][]) {
   let batch = db.batch();
   let batchCount = 0;
 
   for (let i = 0; i < chunks.length; i += 1) {
     const docId = `${materialId}-${i}`;
     const ref = db.collection('ragChunks').doc(docId);
-    batch.set(ref, {
+    const embedding = embeddings?.[i];
+    const payload: Record<string, unknown> = {
       agentId,
       materialId,
       text: chunks[i],
       chunkIndex: i,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
-    }, { merge: true });
+    };
+    if (Array.isArray(embedding)) {
+      payload.embedding = embedding;
+    }
+    batch.set(ref, payload, { merge: true });
     batchCount += 1;
 
     if (batchCount >= 400) {
@@ -1604,55 +1937,98 @@ ${data.extractedText}
   return parts.join('\n\n');
 }
 
-async function getReferenceContext(agentId: string, queryText: string) {
-  if (!VECTOR_INDEX_ENDPOINT_ID || !VECTOR_DEPLOYED_INDEX_ID || !VECTOR_INDEX_ID) {
+function cosineSimilarity(a: number[], b: number[]) {
+  let dot = 0;
+  let aNorm = 0;
+  let bNorm = 0;
+  const length = Math.min(a.length, b.length);
+  for (let i = 0; i < length; i += 1) {
+    const av = a[i];
+    const bv = b[i];
+    dot += av * bv;
+    aNorm += av * av;
+    bNorm += bv * bv;
+  }
+  if (!aNorm || !bNorm) return 0;
+  return dot / (Math.sqrt(aNorm) * Math.sqrt(bNorm));
+}
+
+async function bruteForceReferenceContext(agentId: string, queryVector: number[]) {
+  const snapshot = await db
+    .collection('ragChunks')
+    .where('agentId', '==', agentId)
+    .limit(400)
+    .get();
+
+  if (snapshot.empty) {
     return fallbackReferenceContext(agentId);
   }
+
+  const scored = snapshot.docs
+    .map(docSnap => {
+      const data = docSnap.data();
+      const embedding = Array.isArray(data.embedding) ? data.embedding as number[] : null;
+      const text = typeof data.text === 'string' ? data.text : '';
+      if (!embedding || !text) return null;
+      return { text, score: cosineSimilarity(queryVector, embedding) };
+    })
+    .filter((item): item is { text: string; score: number } => Boolean(item))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 6)
+    .map((item, idx) => `--- KALLA ${idx + 1} ---
+${item.text}
+--- SLUT KALLA ---`);
+
+  if (scored.length === 0) {
+    return fallbackReferenceContext(agentId);
+  }
+
+  return scored.join('\n\n');
+}
+
+async function getReferenceContext(agentId: string, queryText: string) {
   if (!queryText.trim()) {
     return fallbackReferenceContext(agentId);
   }
 
+  let queryVector: number[] | null = null;
   try {
-    const [queryVector] = await embedTexts([queryText]);
+    const [vector] = await embedTexts([queryText]);
+    queryVector = vector || null;
     if (!queryVector || queryVector.length === 0) {
       return fallbackReferenceContext(agentId);
     }
 
-    const request: any = {
-      indexEndpoint: `projects/${PROJECT_ID}/locations/${VERTEX_LOCATION}/indexEndpoints/${VECTOR_INDEX_ENDPOINT_ID}`,
-      deployedIndexId: VECTOR_DEPLOYED_INDEX_ID,
-      queries: [
-        {
-          datapoint: { datapointId: 'query', featureVector: queryVector },
-          neighborCount: 6,
-          restricts: [{ namespace: 'agentId', allowList: [agentId] }]
-        }
-      ],
-      returnFullDatapoint: true
-    };
+    const baseQuery = db
+      .collection('ragChunks')
+      .where('agentId', '==', agentId) as any;
+    if (typeof baseQuery.findNearest !== 'function') {
+      logger.warn('Firestore vector search is not available; using brute-force scan.');
+      return bruteForceReferenceContext(agentId, queryVector);
+    }
+    const vectorQuery = baseQuery.findNearest('embedding', queryVector, {
+      limit: 6,
+      distanceMeasure: 'COSINE'
+    } as any);
 
-    const [response] = await (matchClient as any).findNeighbors(request);
-    const neighbors = response.nearestNeighbors?.[0]?.neighbors || [];
-    const ids = neighbors
-      .map((neighbor: any) => neighbor.datapoint?.datapointId)
-      .filter((id: unknown): id is string => Boolean(id));
-
-    if (ids.length === 0) {
+    const snapshot = await (vectorQuery as any).get();
+    if (!snapshot || snapshot.empty) {
       return fallbackReferenceContext(agentId);
     }
 
-    const docRefs = ids.map((id: string) => db.collection('ragChunks').doc(id));
-    const docs = await db.getAll(...docRefs);
-    const parts = docs
-      .map(docSnap => docSnap.data()?.text)
-      .filter((text): text is string => Boolean(text))
-      .map((text, idx) => `--- KALLA ${idx + 1} ---
+    const parts = snapshot.docs
+      .map((docSnap: admin.firestore.QueryDocumentSnapshot) => docSnap.data()?.text)
+      .filter((text: unknown): text is string => typeof text === 'string' && Boolean(text))
+      .map((text: string, idx: number) => `--- KALLA ${idx + 1} ---
 ${text}
 --- SLUT KALLA ---`);
 
     return parts.join('\n\n');
   } catch (error) {
-    logger.error('Vector search failed, falling back to raw docs.', error);
+    logger.error('Firestore vector search failed, falling back to brute-force scan.', error);
+    if (queryVector && queryVector.length > 0) {
+      return bruteForceReferenceContext(agentId, queryVector);
+    }
     return fallbackReferenceContext(agentId);
   }
 }
@@ -1757,11 +2133,18 @@ export const processMaterial = onDocumentWritten(
       }
 
       const vectors = await embedTexts(trimmedChunks);
+      const alignedEmbeddings = vectors.length === trimmedChunks.length ? vectors : undefined;
 
-      await writeChunks(agentId, materialId, trimmedChunks);
-      if (vectors.length === trimmedChunks.length) {
-        await upsertDatapoints(agentId, materialId, vectors);
+      if (!alignedEmbeddings) {
+        logger.warn('Embedding count mismatch; saving chunks without embeddings.', {
+          agentId,
+          materialId,
+          chunkCount: trimmedChunks.length,
+          embeddingCount: vectors.length
+        });
       }
+
+      await writeChunks(agentId, materialId, trimmedChunks, alignedEmbeddings);
 
       await snapshot.ref.update({
         status: 'ready',
@@ -1811,17 +2194,6 @@ export const cleanupMaterial = onDocumentDeleted(
 
     const chunkSnap = await db.collection('ragChunks').where('materialId', '==', materialId).get();
     if (chunkSnap.empty) return;
-
-    const chunkIds = chunkSnap.docs.map(docSnap => docSnap.id);
-
-    if (VECTOR_INDEX_ID && PROJECT_ID && chunkIds.length > 0) {
-      const index = `projects/${PROJECT_ID}/locations/${VERTEX_LOCATION}/indexes/${VECTOR_INDEX_ID}`;
-      try {
-        await (indexClient as any).removeDatapoints({ index, datapointIds: chunkIds });
-      } catch (error) {
-        logger.warn('Failed to remove datapoints from Vector Search.', error);
-      }
-    }
 
     for (let i = 0; i < chunkSnap.docs.length; i += 400) {
       const batch = db.batch();
@@ -2095,6 +2467,111 @@ apiRouter.post('/admin/model-config', async (req, res) => {
   } catch (error: any) {
     logger.error('Model config update error', error);
     return res.status(500).send(error.message || 'Failed to update model config.');
+  }
+});
+
+apiRouter.get('/admin/usage/report', async (req, res) => {
+  try {
+    const authUser = await requireAdmin(req, res);
+    if (!authUser) return;
+
+    const today = formatUsageDate();
+    const fromRaw = normalizeUsageDate(req.query.from, today);
+    const toRaw = normalizeUsageDate(req.query.to, fromRaw);
+    const [from, to] = fromRaw <= toRaw ? [fromRaw, toRaw] : [toRaw, fromRaw];
+    const fromDate = parseUsageDateKey(from);
+    const toDate = parseUsageDateKey(to);
+    if (!fromDate || !toDate) {
+      return res.status(400).send('Invalid date format. Use YYYYMMDD.');
+    }
+    const diffDays = Math.floor((toDate.getTime() - fromDate.getTime()) / 86400000) + 1;
+    if (diffDays > 120) {
+      return res.status(400).send('Date range too large. Max 120 days.');
+    }
+
+    const routing = await getModelRouting(true);
+    const currency = routing.pricingCurrency || DEFAULT_MODEL_ROUTING.pricingCurrency;
+
+    const getTaskPricing = (task: string) => {
+      if (task === 'embeddings') return routing.embeddings;
+      if (task === 'safeAssessment') return routing.safeAssessment;
+      return routing.tasks[task];
+    };
+
+    const aggregate = new Map<string, {
+      task: string;
+      providerId: string;
+      model: string;
+      requestCount: number;
+      inputTokens: number;
+      outputTokens: number;
+      errorCount: number;
+      latencyMsTotal: number;
+    }>();
+
+    for (let i = 0; i < diffDays; i += 1) {
+      const dateKey = formatUsageDate(new Date(fromDate.getTime() + i * 86400000));
+      const daySnapshot = await db
+        .collection(USAGE_DAILY_COLLECTION)
+        .doc(dateKey)
+        .collection(USAGE_MODELS_SUBCOLLECTION)
+        .get();
+      daySnapshot.forEach(docSnap => {
+        const data = docSnap.data() as Record<string, any>;
+        const task = typeof data.task === 'string' ? data.task : 'unknown';
+        const providerId = typeof data.providerId === 'string' ? data.providerId : '';
+        const model = typeof data.model === 'string' ? data.model : '';
+        if (!providerId || !model) return;
+        const key = `${task}|${providerId}|${model}`;
+        const entry = aggregate.get(key) || {
+          task,
+          providerId,
+          model,
+          requestCount: 0,
+          inputTokens: 0,
+          outputTokens: 0,
+          errorCount: 0,
+          latencyMsTotal: 0
+        };
+        entry.requestCount += safeNumber(data.requestCount);
+        entry.inputTokens += safeNumber(data.inputTokens);
+        entry.outputTokens += safeNumber(data.outputTokens);
+        entry.errorCount += safeNumber(data.errorCount);
+        entry.latencyMsTotal += safeNumber(data.latencyMsTotal);
+        aggregate.set(key, entry);
+      });
+    }
+
+    const rows = Array.from(aggregate.values()).map(entry => {
+      const pricing = getTaskPricing(entry.task);
+      const inputPrice = pricing ? parsePriceValue(pricing.priceInput1M) : 0;
+      const outputPrice = pricing ? parsePriceValue(pricing.priceOutput1M) : 0;
+      const cost = (entry.inputTokens / 1_000_000) * inputPrice
+        + (entry.outputTokens / 1_000_000) * outputPrice;
+      const latencyAvgMs = entry.requestCount ? entry.latencyMsTotal / entry.requestCount : 0;
+      return {
+        ...entry,
+        latencyAvgMs,
+        cost
+      };
+    });
+
+    const totals = rows.reduce(
+      (acc, row) => {
+        acc.requestCount += row.requestCount;
+        acc.inputTokens += row.inputTokens;
+        acc.outputTokens += row.outputTokens;
+        acc.errorCount += row.errorCount;
+        acc.cost += row.cost;
+        return acc;
+      },
+      { requestCount: 0, inputTokens: 0, outputTokens: 0, errorCount: 0, cost: 0 }
+    );
+
+    return res.json({ from, to, currency, rows, totals });
+  } catch (error: any) {
+    logger.error('Usage report error', error);
+    return res.status(500).send(error.message || 'Failed to load usage report.');
   }
 });
 
@@ -2583,13 +3060,14 @@ apiRouter.post('/assessment', async (req, res) => {
     const assessmentSystemPrompt = PROMPT_B_SYSTEM(stringency);
     const jsonRetrySuffix = '\n\nInvalid JSON. Output ONLY the JSON object and nothing else.';
 
-    const runAssessmentModel = async (modelConfig: ModelTaskConfig, label: string, timeoutMs: number) => {
+    const runAssessmentModel = async (modelConfig: ModelTaskConfig, label: string, timeoutMs: number, taskId: string) => {
       const runOnce = async (systemInstruction: string, temperature?: number) => {
         const startedAt = Date.now();
         const response = await withTimeout(
           generateWithProvider({
             providerId: modelConfig.providerId,
             model: modelConfig.model,
+            task: taskId,
             contents: assessmentContents,
             config: {
               systemInstruction,
@@ -2688,9 +3166,13 @@ apiRouter.post('/assessment', async (req, res) => {
       };
     };
 
+    const routingConfig = await getModelRouting();
+    const triageEnabled = routingConfig.triageEnabled !== false;
+
     const assessmentModelA = await resolveTaskModel('assessment');
-    const assessmentModelB = await resolveTaskModel('assessmentB');
-    const adjudicatorModel = await resolveTaskModel('adjudicator');
+    const assessmentModelB = triageEnabled ? await resolveTaskModel('assessmentB') : null;
+    const adjudicatorModel = triageEnabled ? await resolveTaskModel('adjudicator') : null;
+    const safeAssessmentModel = await resolveTaskModel('safeAssessment');
 
     let modelAResponse: { parsed: any; latencyMs: number } | null = null;
     let modelBResponse: { parsed: any; latencyMs: number } | null = null;
@@ -2698,15 +3180,17 @@ apiRouter.post('/assessment', async (req, res) => {
     let modelBError: string | null = null;
 
     try {
-      modelAResponse = await runAssessmentModel(assessmentModelA, 'Model A', ASSESSMENT_TIMEOUT_MS);
+      modelAResponse = await runAssessmentModel(assessmentModelA, 'Model A', ASSESSMENT_TIMEOUT_MS, 'assessment');
     } catch (error: any) {
       modelAError = String(error?.message || error);
     }
 
-    try {
-      modelBResponse = await runAssessmentModel(assessmentModelB, 'Model B', ASSESSMENT_TIMEOUT_MS);
-    } catch (error: any) {
-      modelBError = String(error?.message || error);
+    if (triageEnabled && assessmentModelB) {
+      try {
+        modelBResponse = await runAssessmentModel(assessmentModelB, 'Model B', ASSESSMENT_TIMEOUT_MS, 'assessmentB');
+      } catch (error: any) {
+        modelBError = String(error?.message || error);
+      }
     }
 
     const fallbackAssessment = {
@@ -2762,7 +3246,36 @@ apiRouter.post('/assessment', async (req, res) => {
     evidenceGapScore = finalNormalized.evidenceGapScore;
     avgSelfReflection = finalNormalized.avgSelfReflection;
 
-    if (!invalidJsonFailure && modelANormalized && modelBNormalized) {
+    if (!triageEnabled) {
+      if (!modelANormalized) {
+        try {
+          const safeResponse = await runAssessmentModel(safeAssessmentModel, 'Safe Model', ASSESSMENT_TIMEOUT_MS, 'safeAssessment');
+          finalAssessment = safeResponse.parsed;
+          finalNormalized = normalizeAssessmentResults(safeResponse.parsed);
+          evidenceGapScore = finalNormalized.evidenceGapScore;
+          avgSelfReflection = finalNormalized.avgSelfReflection;
+          boundaryScore = finalNormalized.boundaryScore;
+          finalDecisionSource = 'MODELS_AB';
+          reviewTrigger = 'CONSENSUS';
+          isEscalated = false;
+        } catch (error: any) {
+          modelAError = modelAError || String(error?.message || error);
+          finalDecisionSource = 'HUMAN_REQUIRED';
+          reviewTrigger = 'TIMEOUT_FALLBACK';
+          isEscalated = true;
+          difficultyScore = 1;
+        }
+      } else {
+        difficultyScore = 0;
+        disagreementScore = 0;
+        boundaryScore = finalNormalized.boundaryScore;
+        evidenceGapScore = finalNormalized.evidenceGapScore;
+        avgSelfReflection = finalNormalized.avgSelfReflection;
+        reviewTrigger = 'CONSENSUS';
+        finalDecisionSource = 'MODELS_AB';
+        isEscalated = false;
+      }
+    } else if (!invalidJsonFailure && modelANormalized && modelBNormalized) {
       disagreementScore = modelANormalized.passFail !== modelBNormalized.passFail ? 1 : 0;
       boundaryScore = Math.max(modelANormalized.boundaryScore, modelBNormalized.boundaryScore);
       avgSelfReflection = (modelANormalized.avgSelfReflection + modelBNormalized.avgSelfReflection) / 2;
@@ -2787,28 +3300,29 @@ apiRouter.post('/assessment', async (req, res) => {
       if (shouldEscalate) {
         const adjudicatorPrompt = `${assessmentSystemPrompt}\n\nResolve any disagreement between the two assessments. Use the student text and indicators to decide.`;
         try {
-          const adjudicatorResponse = await withTimeout(
-            generateWithProvider({
-              providerId: adjudicatorModel.providerId,
-              model: adjudicatorModel.model,
-              contents: {
-                parts: [
-                  referencePart,
-                  contextPart,
-                  { text: `MODEL_A_ASSESSMENT:\n${JSON.stringify(modelAParsed)}` },
-                  { text: `MODEL_B_ASSESSMENT:\n${JSON.stringify(modelBParsed)}` },
-                  studentPart
-                ]
-              },
-              config: {
-                systemInstruction: adjudicatorPrompt,
-                responseMimeType: 'application/json',
-                responseSchema: assessmentResponseSchema
-              }
-            }),
-            ADJUDICATOR_TIMEOUT_MS,
-            'Adjudicator'
-          );
+        const adjudicatorResponse = await withTimeout(
+          generateWithProvider({
+            providerId: adjudicatorModel?.providerId || assessmentModelA.providerId,
+            model: adjudicatorModel?.model || assessmentModelA.model,
+            task: 'adjudicator',
+            contents: {
+              parts: [
+                referencePart,
+                contextPart,
+                { text: `MODEL_A_ASSESSMENT:\n${JSON.stringify(modelAParsed)}` },
+                { text: `MODEL_B_ASSESSMENT:\n${JSON.stringify(modelBParsed)}` },
+                studentPart
+              ]
+            },
+            config: {
+              systemInstruction: adjudicatorPrompt,
+              responseMimeType: 'application/json',
+              responseSchema: assessmentResponseSchema
+            }
+          }),
+          ADJUDICATOR_TIMEOUT_MS,
+          'Adjudicator'
+        );
           const adjudicatorParsed = parseJsonFromText(adjudicatorResponse.text || '');
           if (!adjudicatorParsed) {
             throw new Error('invalid_json');
@@ -2833,8 +3347,9 @@ apiRouter.post('/assessment', async (req, res) => {
       try {
         const adjudicatorResponse = await withTimeout(
           generateWithProvider({
-            providerId: adjudicatorModel.providerId,
-            model: adjudicatorModel.model,
+            providerId: adjudicatorModel?.providerId || assessmentModelA.providerId,
+            model: adjudicatorModel?.model || assessmentModelA.model,
+            task: 'adjudicator',
             contents: {
               parts: [
                 referencePart,
@@ -2912,6 +3427,7 @@ apiRouter.post('/assessment', async (req, res) => {
     const feedbackResponse = await generateWithProvider({
       providerId: feedbackModel.providerId,
       model: feedbackModel.model,
+      task: 'feedback',
       contents: {
         parts: [
           referencePart,
@@ -3006,6 +3522,7 @@ Format as a Markdown table:| Criterion | Level 1 | Level 2 | Level 3 |\n|---|---
     const response = await generateWithProvider({
       providerId: improveModel.providerId,
       model: improveModel.model,
+      task: 'criterionImprove',
       contents: prompt,
       config: {
         systemInstruction: systemPrompt,
@@ -3065,6 +3582,7 @@ source_trace must specify which sources were used for object/evidence_min/qualit
     const response = await generateWithProvider({
       providerId: analyzeModel.providerId,
       model: analyzeModel.model,
+      task: 'criterionAnalyze',
       contents: prompt,
       config: {
         systemInstruction: systemPrompt,
@@ -3115,7 +3633,11 @@ source_trace must specify which sources were used for object/evidence_min/qualit
       }
     });
 
-    const payload = JSON.parse(response.text || '{}');
+    const payload = parseJsonFromText(response.text || '');
+    if (!payload || typeof payload !== 'object') {
+      logger.warn('Analyze criterion returned invalid JSON.', { text: response.text });
+      return res.status(500).send('Invalid JSON from model.');
+    }
     const cleanBloomIndex = Math.max(1, Math.min(6, Math.round(Number(payload.bloom_index ?? bloom_index ?? 2))));
     const cleanWeight = Number.isFinite(Number(payload.weight)) ? Number(payload.weight) : (Number.isFinite(Number(weight)) ? Number(weight) : 1);
     const actor = 'Studenten';
@@ -3185,6 +3707,7 @@ apiRouter.post('/translate', async (req, res) => {
     const response = await generateWithProvider({
       providerId: translateModel.providerId,
       model: translateModel.model,
+      task: 'translate',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -3200,7 +3723,11 @@ apiRouter.post('/translate', async (req, res) => {
       }
     });
 
-    const payload = JSON.parse(response.text || '{}');
+    const payload = parseJsonFromText(response.text || '');
+    if (!payload || typeof payload !== 'object') {
+      logger.warn('Translate returned invalid JSON.', { text: response.text });
+      return res.status(500).send('Invalid JSON from model.');
+    }
     await logAudit('translate', {});
     return res.json({
       name: payload.name || name,
@@ -3224,6 +3751,7 @@ apiRouter.post('/support', async (req, res) => {
     const response = await generateWithProvider({
       providerId: supportModel.providerId,
       model: supportModel.model,
+      task: 'support',
       contents: prompt,
       config: {
         systemInstruction: SUPPORT_SYSTEM

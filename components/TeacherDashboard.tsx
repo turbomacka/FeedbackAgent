@@ -8,12 +8,14 @@ import { analyzeCriterion, translateContent, askSupport } from '../services/gemi
 import { createPromoCode, disablePromoCode, listPromoCodes, PromoCodeEntry } from '../services/teacherAuthService';
 import {
   getAdminModelConfig,
+  getUsageReport,
   syncModelProvider,
   updateAdminModelConfig,
   updateModelProvider,
   ModelProvider,
   ModelRoutingConfig,
-  ModelTaskConfig
+  ModelTaskConfig,
+  UsageReport
 } from '../services/adminModelService';
 import { EduTooltip } from './EduTooltip';
 import { generateVerificationPrefix, getVerificationMinimum, getVerificationMaximum } from '../utils/security';
@@ -44,6 +46,13 @@ const serializeMatrix = (header: string[], body: string[][]) => {
   const safeHeader = header.map(h => h.replace(/\n/g, '<br>'));
   const safeBody = body.map(row => row.map(cell => cell.replace(/\n/g, '<br>')));
   return `| ${safeHeader.join(' | ')} |\n| ${header.map(() => '---').join(' | ')} |\n${safeBody.map(row => `| ${row.join(' | ')} |`).join('\n')}`;
+};
+
+const formatDateKey = (date: Date) => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
 };
 
 const BLOOM_LEVELS = [
@@ -187,6 +196,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
   const [modelAdminBusy, setModelAdminBusy] = useState(false);
   const [modelAdminError, setModelAdminError] = useState<string | null>(null);
   const [modelAdminSaved, setModelAdminSaved] = useState(false);
+  const [priceEstimates, setPriceEstimates] = useState<Record<string, { input?: boolean; output?: boolean }>>({});
+  const [priceSavedRow, setPriceSavedRow] = useState<string | null>(null);
+  const priceImportInputRef = useRef<HTMLInputElement | null>(null);
+  const [showPricedOnly, setShowPricedOnly] = useState(false);
+  const [usageFrom, setUsageFrom] = useState(() => formatDateKey(new Date()));
+  const [usageTo, setUsageTo] = useState(() => formatDateKey(new Date()));
+  const [usageBusy, setUsageBusy] = useState(false);
+  const [usageError, setUsageError] = useState<string | null>(null);
+  const [usageReport, setUsageReport] = useState<UsageReport | null>(null);
   const modelConfigLoadedRef = useRef(false);
   const [providerManualInput, setProviderManualInput] = useState<Record<string, string>>({});
   const matrixSaveTimeout = useRef<number | null>(null);
@@ -340,6 +358,16 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
       sv: 'Välj provider och modell för varje del av systemet. Pris anges manuellt per modell.',
       en: 'Choose provider and model per task. Price is entered manually per model.'
     },
+    modelRegionLabel: { sv: 'Region', en: 'Region' },
+    modelRegionGlobal: { sv: 'Global (API)', en: 'Global (API)' },
+    triageToggleLabel: { sv: 'Triage‑bedömning', en: 'Triage assessment' },
+    triageToggleHelp: {
+      sv: 'När triage är av körs endast primär bedömning. Bedömning B och Skiljedomare nedsläcks.',
+      en: 'When triage is off, only the primary assessment runs. Assessment B and Adjudicator are disabled.'
+    },
+    triageOn: { sv: 'På', en: 'On' },
+    triageOff: { sv: 'Av', en: 'Off' },
+    triageDisabledTag: { sv: 'Triage avstängd', en: 'Triage disabled' },
     modelTaskAssessmentHelp: {
       sv: 'Primär bedömning som avgör pass/fail och sätter score_100k (intern sammanvägd poäng). Detta är “Model A” i triage‑flödet och jämförs mot Bedömning B.',
       en: 'Primary assessment that determines pass/fail and sets score_100k (internal aggregate score). This is “Model A” in the triage flow and is compared against Assessment B.'
@@ -397,6 +425,23 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     modelPricePlaceholder: { sv: 't.ex. $0.30', en: 'e.g. $0.30' },
     modelPriceInputLabel: { sv: 'Input', en: 'Input' },
     modelPriceOutputLabel: { sv: 'Output', en: 'Output' },
+    modelPriceSave: { sv: 'Spara pris', en: 'Save price' },
+    modelPriceSavedTag: { sv: 'Sparat', en: 'Saved' },
+    modelPriceEstimateTag: { sv: 'Ej verifierad kostnad', en: 'Unverified cost' },
+    modelPriceTagged: { sv: 'Prissatt', en: 'Priced' },
+    modelPriceImport: { sv: 'Importera prislista', en: 'Import price list' },
+    modelPriceImportHelp: {
+      sv: 'Ladda upp JSON för att fylla priser per modell.',
+      en: 'Upload JSON to fill prices per model.'
+    },
+    modelPriceTemplate: { sv: 'Ladda ner mall', en: 'Download template' },
+    modelPriceTemplateHelp: {
+      sv: 'Hämtar en JSON‑mall med exempelrader.',
+      en: 'Downloads a JSON template with sample rows.'
+    },
+    modelPriceImportMeta: { sv: 'Senaste prislista', en: 'Latest price list' },
+    modelPriceImportNone: { sv: 'Ingen prislista uppladdad ännu.', en: 'No price list uploaded yet.' },
+    modelFilterPriced: { sv: 'Visa enbart prissatta', en: 'Show priced only' },
     modelCurrencyLabel: { sv: 'Valuta', en: 'Currency' },
     modelCurrencyPlaceholder: { sv: 't.ex. USD', en: 'e.g. USD' },
     modelSafeLabel: { sv: 'Safe Model för bedömning', en: 'Safe model for assessment' },
@@ -410,6 +455,31 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     modelSaved: { sv: 'Sparat', en: 'Saved' },
     modelLoadError: { sv: 'Kunde inte ladda modellinställningar.', en: 'Failed to load model settings.' },
     modelSaveError: { sv: 'Kunde inte spara modellval.', en: 'Failed to save model routing.' },
+    usageAdminTitle: { sv: 'Admin: Trafik & kostnad', en: 'Admin: Usage & cost' },
+    usageAdminSubtitle: {
+      sv: 'Hämta en sammanställning per modell för valt datumintervall.',
+      en: 'Fetch a per-model summary for a chosen date range.'
+    },
+    usageAdminHelp: {
+      sv: 'Format: ÅÅÅÅMMDD. Samma datum = idag.',
+      en: 'Format: YYYYMMDD. Same date = today.'
+    },
+    usageFromLabel: { sv: 'Från (YYYYMMDD)', en: 'From (YYYYMMDD)' },
+    usageToLabel: { sv: 'Till (YYYYMMDD)', en: 'To (YYYYMMDD)' },
+    usageFetch: { sv: 'Hämta rapport', en: 'Fetch report' },
+    usageFetching: { sv: 'Hämtar…', en: 'Fetching…' },
+    usageEmpty: { sv: 'Ingen usage hittades för intervallet.', en: 'No usage found for this range.' },
+    usageError: { sv: 'Kunde inte hämta usage.', en: 'Failed to fetch usage.' },
+    usageTableTask: { sv: 'Funktion', en: 'Function' },
+    usageTableProvider: { sv: 'Provider', en: 'Provider' },
+    usageTableModel: { sv: 'Modell', en: 'Model' },
+    usageTableRequests: { sv: 'Anrop', en: 'Requests' },
+    usageTableInput: { sv: 'Input tokens', en: 'Input tokens' },
+    usageTableOutput: { sv: 'Output tokens', en: 'Output tokens' },
+    usageTableErrors: { sv: 'Fel', en: 'Errors' },
+    usageTableCost: { sv: 'Kostnad', en: 'Cost' },
+    usageTableLatency: { sv: 'Latens (ms)', en: 'Latency (ms)' },
+    usageTotalsLabel: { sv: 'Totalt', en: 'Total' },
     passHelp: {
       sv: 'Godkänd-gräns\n\nDetta är ingen procent eller betyg, utan en intern skala (0–100 000) som används för att räkna ut lägsta godkända värde i LMS.',
       en: 'Pass threshold\n\nThis is not a percentage or grade, but an internal 0–100,000 scale used to compute the minimum accepted value in your LMS.'
@@ -963,6 +1033,53 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     void refreshModelConfig();
   }, [isAdmin, showAdminPanel, refreshModelConfig]);
 
+  useEffect(() => {
+    if (!modelRouting) return;
+    let updated = false;
+    const nextTasks: Record<string, ModelTaskConfig> = { ...modelRouting.tasks };
+    const nextEstimates: Record<string, { input?: boolean; output?: boolean }> = {};
+
+    const normalizeConfig = (config: ModelTaskConfig, scope: 'task' | 'embeddings' | 'safeAssessment', taskId?: string) => {
+      const rowKey = getPriceRowKey(scope, taskId);
+      if (!config.providerId || !config.model) {
+        nextEstimates[rowKey] = { input: false, output: false };
+        return config;
+      }
+      const priceKey = getPriceKey(config.providerId, config.model);
+      const entry = priceKey ? modelRouting.priceBook?.[priceKey] : null;
+      const hasPrice = Boolean(entry && (entry.priceInput1M || entry.priceOutput1M));
+      let nextConfig = config;
+      if (!hasPrice) {
+        if (!config.priceInput1M) {
+          nextConfig = { ...nextConfig, priceInput1M: '0' };
+          updated = true;
+        }
+        if (!config.priceOutput1M) {
+          nextConfig = { ...nextConfig, priceOutput1M: '0' };
+          updated = true;
+        }
+      }
+      nextEstimates[rowKey] = { input: !hasPrice, output: !hasPrice };
+      return nextConfig;
+    };
+
+    Object.entries(modelRouting.tasks).forEach(([taskId, config]) => {
+      nextTasks[taskId] = normalizeConfig(config, 'task', taskId);
+    });
+    const nextEmbeddings = normalizeConfig(modelRouting.embeddings, 'embeddings');
+    const nextSafe = normalizeConfig(modelRouting.safeAssessment, 'safeAssessment');
+
+    setPriceEstimates(prev => ({ ...prev, ...nextEstimates }));
+    if (updated) {
+      setModelRouting(prev => (prev ? {
+        ...prev,
+        tasks: nextTasks,
+        embeddings: nextEmbeddings,
+        safeAssessment: nextSafe
+      } : prev));
+    }
+  }, [modelRouting]);
+
   const handleProviderUpdate = async (providerId: string, updates: Partial<ModelProvider>) => {
     setModelAdminError(null);
     setModelAdminBusy(true);
@@ -1013,8 +1130,38 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setModelRouting(prev => {
       if (!prev) return prev;
       const nextTasks = { ...prev.tasks };
-      const existing = nextTasks[taskId] || { providerId: '', model: '' };
-      nextTasks[taskId] = { ...existing, [field]: value };
+      const existing = nextTasks[taskId] || { providerId: '', model: '', priceInput1M: '', priceOutput1M: '' };
+      let nextEntry: ModelTaskConfig = { ...existing, [field]: value };
+      const rowKey = getPriceRowKey('task', taskId);
+
+      if (field === 'providerId') {
+        nextEntry = { providerId: value, model: '', priceInput1M: '', priceOutput1M: '' };
+        setPriceEstimates(prevFlags => ({ ...prevFlags, [rowKey]: { input: false, output: false } }));
+      } else if (field === 'model') {
+        const priceKey = getPriceKey(existing.providerId, value);
+        const cachedEntry = priceKey ? prev.priceBook?.[priceKey] : null;
+        const nextInput = cachedEntry?.priceInput1M?.trim() ? cachedEntry.priceInput1M : '0';
+        const nextOutput = cachedEntry?.priceOutput1M?.trim() ? cachedEntry.priceOutput1M : '0';
+        nextEntry = {
+          ...existing,
+          model: value,
+          priceInput1M: nextInput,
+          priceOutput1M: nextOutput
+        };
+        const isEstimatedInput = !cachedEntry?.priceInput1M;
+        const isEstimatedOutput = !cachedEntry?.priceOutput1M;
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { input: isEstimatedInput, output: isEstimatedOutput }
+        }));
+      } else if (field === 'priceInput1M' || field === 'priceOutput1M') {
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { ...(prevFlags[rowKey] || {}), [field === 'priceInput1M' ? 'input' : 'output']: false }
+        }));
+      }
+
+      nextTasks[taskId] = nextEntry;
       return { ...prev, tasks: nextTasks };
     });
   };
@@ -1023,7 +1170,38 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setModelAdminSaved(false);
     setModelRouting(prev => {
       if (!prev) return prev;
-      return { ...prev, embeddings: { ...prev.embeddings, [field]: value } };
+      const existing = prev.embeddings || { providerId: '', model: '', priceInput1M: '', priceOutput1M: '' };
+      let nextEntry: ModelTaskConfig = { ...existing, [field]: value };
+      const rowKey = getPriceRowKey('embeddings');
+
+      if (field === 'providerId') {
+        nextEntry = { providerId: value, model: '', priceInput1M: '', priceOutput1M: '' };
+        setPriceEstimates(prevFlags => ({ ...prevFlags, [rowKey]: { input: false, output: false } }));
+      } else if (field === 'model') {
+        const priceKey = getPriceKey(existing.providerId, value);
+        const cachedEntry = priceKey ? prev.priceBook?.[priceKey] : null;
+        const nextInput = cachedEntry?.priceInput1M?.trim() ? cachedEntry.priceInput1M : '0';
+        const nextOutput = cachedEntry?.priceOutput1M?.trim() ? cachedEntry.priceOutput1M : '0';
+        nextEntry = {
+          ...existing,
+          model: value,
+          priceInput1M: nextInput,
+          priceOutput1M: nextOutput
+        };
+        const isEstimatedInput = !cachedEntry?.priceInput1M;
+        const isEstimatedOutput = !cachedEntry?.priceOutput1M;
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { input: isEstimatedInput, output: isEstimatedOutput }
+        }));
+      } else if (field === 'priceInput1M' || field === 'priceOutput1M') {
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { ...(prevFlags[rowKey] || {}), [field === 'priceInput1M' ? 'input' : 'output']: false }
+        }));
+      }
+
+      return { ...prev, embeddings: nextEntry };
     });
   };
 
@@ -1031,7 +1209,38 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     setModelAdminSaved(false);
     setModelRouting(prev => {
       if (!prev) return prev;
-      return { ...prev, safeAssessment: { ...prev.safeAssessment, [field]: value } };
+      const existing = prev.safeAssessment || { providerId: '', model: '', priceInput1M: '', priceOutput1M: '' };
+      let nextEntry: ModelTaskConfig = { ...existing, [field]: value };
+      const rowKey = getPriceRowKey('safeAssessment');
+
+      if (field === 'providerId') {
+        nextEntry = { providerId: value, model: '', priceInput1M: '', priceOutput1M: '' };
+        setPriceEstimates(prevFlags => ({ ...prevFlags, [rowKey]: { input: false, output: false } }));
+      } else if (field === 'model') {
+        const priceKey = getPriceKey(existing.providerId, value);
+        const cachedEntry = priceKey ? prev.priceBook?.[priceKey] : null;
+        const nextInput = cachedEntry?.priceInput1M?.trim() ? cachedEntry.priceInput1M : '0';
+        const nextOutput = cachedEntry?.priceOutput1M?.trim() ? cachedEntry.priceOutput1M : '0';
+        nextEntry = {
+          ...existing,
+          model: value,
+          priceInput1M: nextInput,
+          priceOutput1M: nextOutput
+        };
+        const isEstimatedInput = !cachedEntry?.priceInput1M;
+        const isEstimatedOutput = !cachedEntry?.priceOutput1M;
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { input: isEstimatedInput, output: isEstimatedOutput }
+        }));
+      } else if (field === 'priceInput1M' || field === 'priceOutput1M') {
+        setPriceEstimates(prevFlags => ({
+          ...prevFlags,
+          [rowKey]: { ...(prevFlags[rowKey] || {}), [field === 'priceInput1M' ? 'input' : 'output']: false }
+        }));
+      }
+
+      return { ...prev, safeAssessment: nextEntry };
     });
   };
 
@@ -1059,6 +1268,200 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     }
   };
 
+  const handlePriceSave = async (scope: 'task' | 'embeddings' | 'safeAssessment', taskId?: string) => {
+    if (!modelRouting) return;
+    const rowKey = getPriceRowKey(scope, taskId);
+    const config = scope === 'task'
+      ? modelRouting.tasks[taskId || '']
+      : scope === 'embeddings'
+        ? modelRouting.embeddings
+        : modelRouting.safeAssessment;
+    if (!config?.providerId || !config?.model) {
+      setModelAdminError(language === 'sv' ? 'Välj provider och modell först.' : 'Select provider and model first.');
+      return;
+    }
+    const priceInput = config.priceInput1M || '';
+    const priceOutput = config.priceOutput1M || '';
+    const priceKey = getPriceKey(config.providerId, config.model);
+    if (!priceKey) return;
+
+    const nextTasks = { ...modelRouting.tasks };
+    Object.keys(nextTasks).forEach((key) => {
+      const entry = nextTasks[key];
+      if (entry?.providerId === config.providerId && entry?.model === config.model) {
+        nextTasks[key] = { ...entry, priceInput1M: priceInput, priceOutput1M: priceOutput };
+      }
+    });
+    const nextEmbeddings = modelRouting.embeddings.providerId === config.providerId && modelRouting.embeddings.model === config.model
+      ? { ...modelRouting.embeddings, priceInput1M: priceInput, priceOutput1M: priceOutput }
+      : modelRouting.embeddings;
+    const nextSafe = modelRouting.safeAssessment.providerId === config.providerId && modelRouting.safeAssessment.model === config.model
+      ? { ...modelRouting.safeAssessment, priceInput1M: priceInput, priceOutput1M: priceOutput }
+      : modelRouting.safeAssessment;
+
+    const nextRouting: ModelRoutingConfig = {
+      ...modelRouting,
+      tasks: nextTasks,
+      embeddings: nextEmbeddings,
+      safeAssessment: nextSafe,
+      priceBook: {
+        ...(modelRouting.priceBook || {}),
+        [priceKey]: { priceInput1M: priceInput, priceOutput1M: priceOutput }
+      }
+    };
+
+    setModelAdminBusy(true);
+    setModelAdminError(null);
+    try {
+      const { routing } = await updateAdminModelConfig(nextRouting, providerAllowlist);
+      setModelRouting(routing);
+      setPriceEstimates(prev => {
+        const next = { ...prev };
+        Object.keys(nextTasks).forEach((task) => {
+          const entry = nextTasks[task];
+          if (entry?.providerId === config.providerId && entry?.model === config.model) {
+            next[getPriceRowKey('task', task)] = { input: false, output: false };
+          }
+        });
+        if (nextEmbeddings.providerId === config.providerId && nextEmbeddings.model === config.model) {
+          next[getPriceRowKey('embeddings')] = { input: false, output: false };
+        }
+        if (nextSafe.providerId === config.providerId && nextSafe.model === config.model) {
+          next[getPriceRowKey('safeAssessment')] = { input: false, output: false };
+        }
+        return next;
+      });
+      setPriceSavedRow(rowKey);
+      setTimeout(() => setPriceSavedRow(null), 1500);
+    } catch (err: any) {
+      setModelAdminError(err?.message || t('modelSaveError'));
+    } finally {
+      setModelAdminBusy(false);
+    }
+  };
+
+  const handlePriceImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !modelRouting) return;
+    setModelAdminError(null);
+    setModelAdminBusy(true);
+    setModelAdminSaved(false);
+    try {
+      const content = await file.text();
+      const payload = JSON.parse(content);
+      const entries = Array.isArray(payload?.prices) ? payload.prices : [];
+      if (!entries.length) {
+        throw new Error(language === 'sv' ? 'Ingen prislista hittades i filen.' : 'No price list found in file.');
+      }
+
+      const normalizePrice = (value: unknown) => {
+        if (value === null || value === undefined) return '';
+        if (typeof value === 'number') return value.toString();
+        if (typeof value === 'string') return value.trim();
+        return '';
+      };
+
+      const nextPriceBook: Record<string, { priceInput1M?: string; priceOutput1M?: string }> = {
+        ...(modelRouting.priceBook || {})
+      };
+      entries.forEach((entry: any) => {
+        const providerId = typeof entry?.providerId === 'string' ? entry.providerId.trim() : '';
+        const model = typeof entry?.model === 'string' ? entry.model.trim() : '';
+        if (!providerId || !model) return;
+        const key = getPriceKey(providerId, model);
+        if (!key) return;
+        nextPriceBook[key] = {
+          priceInput1M: normalizePrice(entry.priceInput1M),
+          priceOutput1M: normalizePrice(entry.priceOutput1M)
+        };
+      });
+
+      const applyPrice = (config: ModelTaskConfig) => {
+        const key = getPriceKey(config.providerId, config.model);
+        if (!key || !nextPriceBook[key]) return config;
+        return { ...config, ...nextPriceBook[key] };
+      };
+
+      const nextTasks: Record<string, ModelTaskConfig> = {};
+      Object.entries(modelRouting.tasks).forEach(([taskId, config]) => {
+        nextTasks[taskId] = applyPrice(config);
+      });
+
+      const nextRouting: ModelRoutingConfig = {
+        ...modelRouting,
+        tasks: nextTasks,
+        embeddings: applyPrice(modelRouting.embeddings),
+        safeAssessment: applyPrice(modelRouting.safeAssessment),
+        priceBook: nextPriceBook,
+        pricingCurrency: typeof payload?.currency === 'string'
+          ? payload.currency.trim()
+          : modelRouting.pricingCurrency,
+        priceImportMeta: {
+          fileName: file.name,
+          importedAt: Date.now()
+        }
+      };
+
+      const { routing } = await updateAdminModelConfig(nextRouting, providerAllowlist);
+      setModelRouting(routing);
+      setPriceEstimates(prev => {
+        const next = { ...prev };
+        Object.entries(nextTasks).forEach(([taskId, config]) => {
+          const key = getPriceRowKey('task', taskId);
+          if (config.priceInput1M || config.priceOutput1M) {
+            next[key] = { input: false, output: false };
+          }
+        });
+        if (nextRouting.embeddings.priceInput1M || nextRouting.embeddings.priceOutput1M) {
+          next[getPriceRowKey('embeddings')] = { input: false, output: false };
+        }
+        if (nextRouting.safeAssessment.priceInput1M || nextRouting.safeAssessment.priceOutput1M) {
+          next[getPriceRowKey('safeAssessment')] = { input: false, output: false };
+        }
+        return next;
+      });
+      setModelAdminSaved(true);
+      setTimeout(() => setModelAdminSaved(false), 1500);
+    } catch (err: any) {
+      setModelAdminError(err?.message || t('modelSaveError'));
+    } finally {
+      setModelAdminBusy(false);
+    }
+  };
+
+  const handlePriceTemplateDownload = () => {
+    const template = {
+      currency: modelRouting?.pricingCurrency || 'USD',
+      prices: [
+        { providerId: 'gemini-api', model: 'gemini-3-flash-preview', priceInput1M: '0.30', priceOutput1M: '0.60' },
+        { providerId: 'openai', model: 'o3-mini', priceInput1M: '1.00', priceOutput1M: '4.00' }
+      ]
+    };
+    const blob = new Blob([JSON.stringify(template, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'model-price-template.json';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleUsageFetch = async () => {
+    setUsageError(null);
+    setUsageBusy(true);
+    try {
+      const report = await getUsageReport(usageFrom.trim(), usageTo.trim());
+      setUsageReport(report);
+    } catch (err: any) {
+      setUsageError(err?.message || t('usageError'));
+    } finally {
+      setUsageBusy(false);
+    }
+  };
+
   const getTaskProviders = (taskId: string) =>
     modelProviders.filter(provider => {
       if (!provider.enabled) return false;
@@ -1072,10 +1475,10 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     const provider = modelProviders.find(item => item.id === providerId);
     if (!provider) return [];
     const manual = Array.isArray(provider.manualModelIds)
-      ? provider.manualModelIds.map(id => ({ id, label: id }))
+      ? provider.manualModelIds.map(id => ({ id, label: `${id} (${language === 'sv' ? 'manuell' : 'manual'})` }))
       : [];
     const synced = Array.isArray(provider.syncedModels) ? provider.syncedModels : [];
-    const combined = [...manual, ...synced];
+    const combined = [...synced, ...manual];
     const seen = new Set<string>();
     return combined.filter(model => {
       if (!model?.id || seen.has(model.id)) return false;
@@ -1084,12 +1487,135 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     });
   };
 
+  const getModelOptionLabel = (providerId: string, model: { id: string; label: string }) => {
+    const key = getPriceKey(providerId, model.id);
+    const hasPrice = Boolean(key && modelRouting?.priceBook?.[key] && (
+      modelRouting.priceBook[key].priceInput1M || modelRouting.priceBook[key].priceOutput1M
+    ));
+    return hasPrice ? `${model.label} • ${t('modelPriceTagged')}` : model.label;
+  };
+
+  const getFilteredModels = (providerId: string) => {
+    const models = getProviderModels(providerId);
+    if (!showPricedOnly) return models;
+    return models.filter(model => {
+      const key = getPriceKey(providerId, model.id);
+      const entry = key ? modelRouting?.priceBook?.[key] : null;
+      return Boolean(entry && (entry.priceInput1M || entry.priceOutput1M));
+    });
+  };
+
+  const getProviderRegion = (providerId: string) => {
+    const provider = modelProviders.find(item => item.id === providerId);
+    if (!provider) return '';
+    const location = provider.location?.trim();
+    if (location) return location;
+    return t('modelRegionGlobal');
+  };
+
+  const getProviderDisplayLabel = (provider: ModelProvider) => {
+    const region = provider.location?.trim();
+    if (provider.id === 'gemini') {
+      return `${language === 'sv' ? 'Gemini (Vertex)' : 'Gemini (Vertex)'}${region ? ` • ${region}` : ''}`;
+    }
+    if (provider.id === 'gemini-api') {
+      return `${language === 'sv' ? 'Gemini (API)' : 'Gemini (API)'} • ${t('modelRegionGlobal')}`;
+    }
+    if (provider.type === 'native-google') {
+      return `${provider.label}${region ? ` • ${region}` : ` • ${t('modelRegionGlobal')}`}`;
+    }
+    return provider.label;
+  };
+
+  const buildHealthTooltip = (
+    health: { status: 'ok' | 'error'; checkedAt: number; message?: string } | undefined,
+    region: string
+  ) => {
+    const base = health?.message || (health?.status === 'ok' ? 'OK' : 'Error');
+    const regionLine = region ? `${t('modelRegionLabel')}: ${region}` : '';
+    return [base, regionLine].filter(Boolean).join(' • ');
+  };
+
   const formatTimestamp = (value: any) => {
     if (!value) return '';
     if (typeof value === 'number') return new Date(value).toLocaleString();
     if (typeof value?.toMillis === 'function') return new Date(value.toMillis()).toLocaleString();
     if (typeof value?.seconds === 'number') return new Date(value.seconds * 1000).toLocaleString();
     return '';
+  };
+
+  const formatUsageNumber = (value: number, maximumFractionDigits = 0) => new Intl.NumberFormat(
+    language === 'sv' ? 'sv-SE' : 'en-US',
+    { maximumFractionDigits }
+  ).format(value);
+
+  const formatUsageCost = (value: number, currency: string) => {
+    const suffix = currency ? ` ${currency}` : '';
+    return `${formatUsageNumber(value, 4)}${suffix}`;
+  };
+
+  const getPriceKey = (providerId: string, model: string) => (providerId && model ? `${providerId}::${model}` : '');
+
+  const getPriceRowKey = (scope: 'task' | 'embeddings' | 'safeAssessment', id?: string) =>
+    scope === 'task' ? `task:${id}` : scope;
+
+  const parsePriceValue = (value: string) => {
+    if (!value) return null;
+    const normalized = value.replace(/[^\d,.\-]/g, '').replace(',', '.');
+    const num = Number(normalized);
+    return Number.isFinite(num) ? num : null;
+  };
+
+  const formatPriceValue = (value: number | null) => {
+    if (value === null || Number.isNaN(value)) return '';
+    const rounded = Math.round(value * 10000) / 10000;
+    return rounded.toString();
+  };
+
+  const getAveragePrice = (routing: ModelRoutingConfig | null, excludeKey?: string) => {
+    if (!routing?.priceBook) return { input: null, output: null };
+    let inputSum = 0;
+    let inputCount = 0;
+    let outputSum = 0;
+    let outputCount = 0;
+    Object.entries(routing.priceBook).forEach(([key, entry]) => {
+      if (excludeKey && key === excludeKey) return;
+      const input = parsePriceValue(entry.priceInput1M || '');
+      const output = parsePriceValue(entry.priceOutput1M || '');
+      if (input !== null) {
+        inputSum += input;
+        inputCount += 1;
+      }
+      if (output !== null) {
+        outputSum += output;
+        outputCount += 1;
+      }
+    });
+    return {
+      input: inputCount ? inputSum / inputCount : null,
+      output: outputCount ? outputSum / outputCount : null
+    };
+  };
+
+  const lookupPriceBook = (routing: ModelRoutingConfig | null, providerId: string, model: string) => {
+    if (!routing) return null;
+    const key = getPriceKey(providerId, model);
+    if (!key) return null;
+    const entry = routing.priceBook?.[key];
+    if (!entry) return null;
+    return {
+      priceInput1M: entry.priceInput1M || '',
+      priceOutput1M: entry.priceOutput1M || ''
+    };
+  };
+
+  const getTaskLabel = (taskId: string) => {
+    const match = MODEL_TASKS.find(task => task.id === taskId);
+    if (match) return t(match.labelKey as any);
+    if (taskId === 'embeddings') return t('modelTaskEmbeddings' as any);
+    if (taskId === 'safeAssessment') return t('modelSafeLabel' as any);
+    if (taskId === 'healthCheck') return language === 'sv' ? 'Hälsokontroll' : 'Health check';
+    return taskId;
   };
 
   const upsertAccessCode = async (agentId: string, code: string) => {
@@ -1844,6 +2370,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
     };
   }, [agentSubmissions]);
 
+  const usageRows = useMemo(() => {
+    if (!usageReport?.rows) return [];
+    return [...usageReport.rows].sort((a, b) => b.cost - a.cost);
+  }, [usageReport]);
+
   const activeAgent = agents.find(a => a.id === activeInsightsId);
 
   const handleDownloadLog = async (format: 'csv' | 'json' | 'txt') => {
@@ -2113,7 +2644,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   <div key={provider.id} className="bg-slate-50/80 border border-slate-100 rounded-2xl p-4 space-y-4">
                     <div className="flex items-start justify-between gap-4">
                       <div>
-                        <div className="text-sm font-black text-slate-900">{provider.label}</div>
+                        <div className="text-sm font-black text-slate-900">{getProviderDisplayLabel(provider)}</div>
                         <div className="text-[10px] font-black uppercase tracking-widest text-slate-400">{provider.type}</div>
                       </div>
                       <button
@@ -2314,19 +2845,107 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
               <div>
                 <h4 className="text-sm font-black text-slate-900">{t('modelCurrencyLabel')}</h4>
               </div>
-              <input
-                type="text"
-                value={modelRouting?.pricingCurrency || ''}
-                onChange={(e) => handleCurrencyChange(e.target.value)}
-                placeholder={t('modelCurrencyPlaceholder')}
-                className="w-full max-w-[160px] px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold"
-              />
+              <div className="flex flex-wrap items-center gap-3">
+                <input
+                  type="text"
+                  value={modelRouting?.pricingCurrency || ''}
+                  onChange={(e) => handleCurrencyChange(e.target.value)}
+                  placeholder={t('modelCurrencyPlaceholder')}
+                  className="w-full max-w-[160px] px-3 py-2 rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold"
+                />
+                <input
+                  ref={priceImportInputRef}
+                  type="file"
+                  accept="application/json"
+                  className="hidden"
+                  onChange={handlePriceImport}
+                />
+                <EduTooltip text={t('modelPriceImportHelp')}>
+                  <button
+                    type="button"
+                    onClick={() => priceImportInputRef.current?.click()}
+                    className="px-3 py-2 rounded-full border border-slate-200 bg-white text-[10px] font-black uppercase tracking-widest text-slate-600 hover:text-slate-900"
+                  >
+                    {t('modelPriceImport')}
+                  </button>
+                </EduTooltip>
+                <EduTooltip text={t('modelPriceTemplateHelp')}>
+                  <button
+                    type="button"
+                    onClick={handlePriceTemplateDownload}
+                    className="px-3 py-2 rounded-full border border-slate-200 bg-white text-[10px] font-black uppercase tracking-widest text-slate-600 hover:text-slate-900"
+                  >
+                    {t('modelPriceTemplate')}
+                  </button>
+                </EduTooltip>
+              </div>
+              <div className="text-[11px] font-medium text-slate-500">
+                <span className="font-black uppercase tracking-widest text-slate-400 mr-2">
+                  {t('modelPriceImportMeta')}
+                </span>
+                {modelRouting?.priceImportMeta?.fileName ? (
+                  <span>
+                    {modelRouting.priceImportMeta.fileName} • {new Date(modelRouting.priceImportMeta.importedAt).toLocaleString()}
+                  </span>
+                ) : (
+                  <span>{t('modelPriceImportNone')}</span>
+                )}
+              </div>
             </div>
 
             <div className="space-y-4">
               <div>
                 <h4 className="text-sm font-black text-slate-900">{t('modelRoutingTitle')}</h4>
                 <p className="text-xs text-slate-500 font-medium">{t('modelRoutingHelp')}</p>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
+                <div className="flex items-center gap-2 text-xs font-black text-slate-700">
+                  <span>{t('triageToggleLabel')}</span>
+                  <EduTooltip text={t('triageToggleHelp')}>
+                    <span className="text-slate-400 text-[11px]">
+                      <i className="fas fa-circle-info" />
+                    </span>
+                  </EduTooltip>
+                </div>
+                <label className="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-slate-500">
+                  <input
+                    type="checkbox"
+                    checked={showPricedOnly}
+                    onChange={(e) => setShowPricedOnly(e.target.checked)}
+                    className="h-4 w-4 rounded border-slate-300 text-emerald-600"
+                  />
+                  {t('modelFilterPriced')}
+                </label>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModelAdminSaved(false);
+                      setModelRouting(prev => (prev ? { ...prev, triageEnabled: true } : prev));
+                    }}
+                    className={`px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest border ${
+                      modelRouting?.triageEnabled !== false
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-100'
+                        : 'bg-slate-100 text-slate-500 border-slate-200'
+                    }`}
+                  >
+                    {t('triageOn')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setModelAdminSaved(false);
+                      setModelRouting(prev => (prev ? { ...prev, triageEnabled: false } : prev));
+                    }}
+                    className={`px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest border ${
+                      modelRouting?.triageEnabled === false
+                        ? 'bg-rose-50 text-rose-700 border-rose-100'
+                        : 'bg-slate-100 text-slate-500 border-slate-200'
+                    }`}
+                  >
+                    {t('triageOff')}
+                  </button>
+                </div>
               </div>
               <div className="space-y-3">
                 <div className="hidden lg:grid grid-cols-[220px_1fr_1fr_140px_140px] gap-3 px-4 text-[10px] font-black uppercase tracking-widest text-slate-400">
@@ -2340,10 +2959,20 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   const taskConfig = modelRouting?.tasks?.[task.id] || { providerId: '', model: '', priceInput1M: '', priceOutput1M: '' };
                   const health = modelRouting?.health?.[task.id];
                   const providers = getTaskProviders(task.id);
-                  const models = getProviderModels(taskConfig.providerId);
+                  const models = getFilteredModels(taskConfig.providerId);
+                  const region = getProviderRegion(taskConfig.providerId);
+                  const rowKey = getPriceRowKey('task', task.id);
+                  const estimateFlags = priceEstimates[rowKey];
+                  const showEstimateTag = Boolean(estimateFlags?.input || estimateFlags?.output);
                   const tooltipKey = `${task.labelKey}Help` as keyof typeof translations;
+                  const triageDisabled = modelRouting?.triageEnabled === false && (task.id === 'assessmentB' || task.id === 'adjudicator');
                   return (
-                    <div key={task.id} className="grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
+                    <div
+                      key={task.id}
+                      className={`grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3 ${
+                        triageDisabled ? 'opacity-50' : ''
+                      }`}
+                    >
                       <div className="text-xs font-black text-slate-700 flex items-center gap-2">
                         <span>{t(task.labelKey as any)}</span>
                         {translations[tooltipKey] && (
@@ -2354,7 +2983,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                           </EduTooltip>
                         )}
                         {health && (
-                          <EduTooltip text={health.message || (health.status === 'ok' ? 'OK' : 'Error')}>
+                          <EduTooltip text={buildHealthTooltip(health, region)}>
                             <span
                               className={`inline-flex h-2.5 w-2.5 rounded-full ${
                                 health.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
@@ -2362,28 +2991,40 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                             />
                           </EduTooltip>
                         )}
+                        {region && (
+                          <span className="text-[9px] font-semibold text-slate-400">
+                            {t('modelRegionLabel')}: {region}
+                          </span>
+                        )}
+                        {triageDisabled && (
+                          <span className="text-[9px] font-black uppercase tracking-widest text-slate-400">
+                            {t('triageDisabledTag')}
+                          </span>
+                        )}
                       </div>
                       <select
                         value={taskConfig.providerId || ''}
                         onChange={(e) => handleRoutingChange(task.id, 'providerId', e.target.value)}
+                        disabled={triageDisabled}
                         className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                       >
                         <option value="">{t('modelSelectProvider')}</option>
                         {providers.map(provider => (
                           <option key={provider.id} value={provider.id}>
-                            {provider.label}
+                            {getProviderDisplayLabel(provider)}
                           </option>
                         ))}
                       </select>
                       <select
                         value={taskConfig.model || ''}
                         onChange={(e) => handleRoutingChange(task.id, 'model', e.target.value)}
+                        disabled={triageDisabled}
                         className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                       >
                         <option value="">{t('modelSelectModel')}</option>
                         {models.map(model => (
                           <option key={model.id} value={model.id}>
-                            {model.label}
+                            {getModelOptionLabel(taskConfig.providerId, model)}
                           </option>
                         ))}
                       </select>
@@ -2392,15 +3033,37 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                         value={taskConfig.priceInput1M || ''}
                         onChange={(e) => handleRoutingChange(task.id, 'priceInput1M', e.target.value)}
                         placeholder={t('modelPricePlaceholder')}
+                        disabled={triageDisabled}
                         className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                       />
-                      <input
-                        type="text"
-                        value={taskConfig.priceOutput1M || ''}
-                        onChange={(e) => handleRoutingChange(task.id, 'priceOutput1M', e.target.value)}
-                        placeholder={t('modelPricePlaceholder')}
-                        className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
-                      />
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          value={taskConfig.priceOutput1M || ''}
+                          onChange={(e) => handleRoutingChange(task.id, 'priceOutput1M', e.target.value)}
+                          placeholder={t('modelPricePlaceholder')}
+                          disabled={triageDisabled}
+                          className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handlePriceSave('task', task.id)}
+                          disabled={triageDisabled || modelAdminBusy}
+                          className="px-2 py-2 rounded-xl border border-slate-200 bg-white text-[9px] font-black uppercase tracking-widest text-slate-600 hover:text-slate-900"
+                        >
+                          {t('modelPriceSave')}
+                        </button>
+                      </div>
+                      {showEstimateTag && (
+                        <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-amber-600">
+                          {t('modelPriceEstimateTag')}
+                        </div>
+                      )}
+                      {priceSavedRow === rowKey && (
+                        <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-emerald-600">
+                          {t('modelPriceSavedTag')}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
@@ -2414,13 +3077,18 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                       </span>
                     </EduTooltip>
                     {modelRouting?.health?.embeddings && (
-                      <EduTooltip text={modelRouting.health.embeddings.message || (modelRouting.health.embeddings.status === 'ok' ? 'OK' : 'Error')}>
+                      <EduTooltip text={buildHealthTooltip(modelRouting.health.embeddings, getProviderRegion(modelRouting?.embeddings?.providerId || ''))}>
                         <span
                           className={`inline-flex h-2.5 w-2.5 rounded-full ${
                             modelRouting.health.embeddings.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
                           }`}
                         />
                       </EduTooltip>
+                    )}
+                    {modelRouting?.embeddings?.providerId && (
+                      <span className="text-[9px] font-semibold text-slate-400">
+                        {t('modelRegionLabel')}: {getProviderRegion(modelRouting.embeddings.providerId)}
+                      </span>
                     )}
                   </div>
                   <select
@@ -2430,7 +3098,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   >
                     {getTaskProviders('embeddings').map(provider => (
                       <option key={provider.id} value={provider.id}>
-                        {provider.label}
+                        {getProviderDisplayLabel(provider)}
                       </option>
                     ))}
                   </select>
@@ -2439,9 +3107,9 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     onChange={(e) => handleEmbeddingChange('model', e.target.value)}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                   >
-                    {getProviderModels(modelRouting?.embeddings?.providerId || '').map(model => (
+                    {getFilteredModels(modelRouting?.embeddings?.providerId || '').map(model => (
                       <option key={model.id} value={model.id}>
-                        {model.label}
+                        {getModelOptionLabel(modelRouting?.embeddings?.providerId || '', model)}
                       </option>
                     ))}
                   </select>
@@ -2452,13 +3120,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     placeholder={t('modelPricePlaceholder')}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                   />
-                  <input
-                    type="text"
-                    value={modelRouting?.embeddings?.priceOutput1M || ''}
-                    onChange={(e) => handleEmbeddingChange('priceOutput1M', e.target.value)}
-                    placeholder={t('modelPricePlaceholder')}
-                    className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
-                  />
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={modelRouting?.embeddings?.priceOutput1M || ''}
+                      onChange={(e) => handleEmbeddingChange('priceOutput1M', e.target.value)}
+                      placeholder={t('modelPricePlaceholder')}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handlePriceSave('embeddings')}
+                      disabled={modelAdminBusy}
+                      className="px-2 py-2 rounded-xl border border-slate-200 bg-white text-[9px] font-black uppercase tracking-widest text-slate-600 hover:text-slate-900"
+                    >
+                      {t('modelPriceSave')}
+                    </button>
+                  </div>
+                  {priceEstimates[getPriceRowKey('embeddings')]?.input || priceEstimates[getPriceRowKey('embeddings')]?.output ? (
+                    <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-amber-600">
+                      {t('modelPriceEstimateTag')}
+                    </div>
+                  ) : null}
+                  {priceSavedRow === getPriceRowKey('embeddings') && (
+                    <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-emerald-600">
+                      {t('modelPriceSavedTag')}
+                    </div>
+                  )}
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-[220px_1fr_1fr_140px_140px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3">
@@ -2470,13 +3158,18 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                       </span>
                     </EduTooltip>
                     {modelRouting?.health?.safeAssessment && (
-                      <EduTooltip text={modelRouting.health.safeAssessment.message || (modelRouting.health.safeAssessment.status === 'ok' ? 'OK' : 'Error')}>
+                      <EduTooltip text={buildHealthTooltip(modelRouting.health.safeAssessment, getProviderRegion(modelRouting?.safeAssessment?.providerId || ''))}>
                         <span
                           className={`inline-flex h-2.5 w-2.5 rounded-full ${
                             modelRouting.health.safeAssessment.status === 'ok' ? 'bg-emerald-500' : 'bg-rose-500'
                           }`}
                         />
                       </EduTooltip>
+                    )}
+                    {modelRouting?.safeAssessment?.providerId && (
+                      <span className="text-[9px] font-semibold text-slate-400">
+                        {t('modelRegionLabel')}: {getProviderRegion(modelRouting.safeAssessment.providerId)}
+                      </span>
                     )}
                   </div>
                   <select
@@ -2487,7 +3180,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     <option value="">{t('modelSelectProvider')}</option>
                     {getTaskProviders('assessment').map(provider => (
                       <option key={provider.id} value={provider.id}>
-                        {provider.label}
+                        {getProviderDisplayLabel(provider)}
                       </option>
                     ))}
                   </select>
@@ -2497,9 +3190,9 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                   >
                     <option value="">{t('modelSelectModel')}</option>
-                    {getProviderModels(modelRouting?.safeAssessment?.providerId || '').map(model => (
+                    {getFilteredModels(modelRouting?.safeAssessment?.providerId || '').map(model => (
                       <option key={model.id} value={model.id}>
-                        {model.label}
+                        {getModelOptionLabel(modelRouting?.safeAssessment?.providerId || '', model)}
                       </option>
                     ))}
                   </select>
@@ -2510,13 +3203,33 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                     placeholder={t('modelPricePlaceholder')}
                     className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
                   />
-                  <input
-                    type="text"
-                    value={modelRouting?.safeAssessment?.priceOutput1M || ''}
-                    onChange={(e) => handleSafeAssessmentChange('priceOutput1M', e.target.value)}
-                    placeholder={t('modelPricePlaceholder')}
-                    className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
-                  />
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={modelRouting?.safeAssessment?.priceOutput1M || ''}
+                      onChange={(e) => handleSafeAssessmentChange('priceOutput1M', e.target.value)}
+                      placeholder={t('modelPricePlaceholder')}
+                      className="w-full px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handlePriceSave('safeAssessment')}
+                      disabled={modelAdminBusy}
+                      className="px-2 py-2 rounded-xl border border-slate-200 bg-white text-[9px] font-black uppercase tracking-widest text-slate-600 hover:text-slate-900"
+                    >
+                      {t('modelPriceSave')}
+                    </button>
+                  </div>
+                  {priceEstimates[getPriceRowKey('safeAssessment')]?.input || priceEstimates[getPriceRowKey('safeAssessment')]?.output ? (
+                    <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-amber-600">
+                      {t('modelPriceEstimateTag')}
+                    </div>
+                  ) : null}
+                  {priceSavedRow === getPriceRowKey('safeAssessment') && (
+                    <div className="lg:col-span-5 text-[9px] font-black uppercase tracking-widest text-emerald-600">
+                      {t('modelPriceSavedTag')}
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -2535,6 +3248,104 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({ agents, subm
                   <span className="text-[9px] font-black uppercase tracking-widest text-emerald-600">{t('modelSaved')}</span>
                 )}
               </div>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <h4 className="text-sm font-black text-slate-900">{t('usageAdminTitle')}</h4>
+                <p className="text-xs text-slate-500 font-medium">{t('usageAdminSubtitle')}</p>
+                <p className="text-[11px] text-slate-400 font-medium">{t('usageAdminHelp')}</p>
+              </div>
+              <div className="flex flex-wrap items-end gap-3">
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('usageFromLabel')}</label>
+                  <input
+                    type="text"
+                    value={usageFrom}
+                    onChange={(e) => setUsageFrom(e.target.value)}
+                    placeholder="YYYYMMDD"
+                    className="w-40 px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-slate-400">{t('usageToLabel')}</label>
+                  <input
+                    type="text"
+                    value={usageTo}
+                    onChange={(e) => setUsageTo(e.target.value)}
+                    placeholder="YYYYMMDD"
+                    className="w-40 px-3 py-2 rounded-xl border border-slate-200 bg-white text-xs font-semibold"
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={handleUsageFetch}
+                  disabled={usageBusy}
+                  className={`px-5 py-2.5 rounded-xl text-[10px] font-black uppercase tracking-widest text-white ${
+                    usageBusy ? 'bg-gray-400' : 'bg-slate-900 hover:bg-slate-800'
+                  }`}
+                >
+                  {usageBusy ? t('usageFetching') : t('usageFetch')}
+                </button>
+              </div>
+              {usageError && (
+                <p className="text-[10px] font-black uppercase tracking-widest text-red-500">{usageError}</p>
+              )}
+              {usageReport && (
+                <div className="bg-white border border-slate-100 rounded-2xl p-4 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-[10px] font-black uppercase tracking-widest text-slate-400">
+                    <span>{usageReport.from} → {usageReport.to}</span>
+                    <span>{t('modelCurrencyLabel')}: {usageReport.currency || 'USD'}</span>
+                  </div>
+                  {usageRows.length === 0 ? (
+                    <p className="text-xs text-slate-500 font-medium">{t('usageEmpty')}</p>
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="overflow-x-auto">
+                        <div className="min-w-[1040px] space-y-2">
+                          <div className="grid grid-cols-[200px_140px_minmax(260px,1fr)_120px_120px_90px_70px_120px_110px] gap-3 text-[9px] font-black uppercase tracking-widest text-slate-400 px-4">
+                            <span>{t('usageTableTask')}</span>
+                            <span>{t('usageTableProvider')}</span>
+                            <span>{t('usageTableModel')}</span>
+                            <span>{t('usageTableInput')}</span>
+                            <span>{t('usageTableOutput')}</span>
+                            <span>{t('usageTableRequests')}</span>
+                            <span>{t('usageTableErrors')}</span>
+                            <span>{t('usageTableCost')}</span>
+                            <span>{t('usageTableLatency')}</span>
+                          </div>
+                          {usageRows.map(row => (
+                            <div
+                              key={`${row.task}-${row.providerId}-${row.model}`}
+                              className="grid grid-cols-[200px_140px_minmax(260px,1fr)_120px_120px_90px_70px_120px_110px] gap-3 items-center bg-slate-50/70 border border-slate-100 rounded-2xl px-4 py-3"
+                            >
+                              <div className="text-xs font-black text-slate-700">{getTaskLabel(row.task)}</div>
+                              <div className="text-xs text-slate-500 font-semibold">{row.providerId}</div>
+                              <div className="text-xs text-slate-600 font-semibold break-all">{row.model}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageNumber(row.inputTokens)}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageNumber(row.outputTokens)}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageNumber(row.requestCount)}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageNumber(row.errorCount)}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageCost(row.cost, usageReport.currency)}</div>
+                              <div className="text-xs font-semibold text-slate-700">{formatUsageNumber(row.latencyAvgMs, 0)}</div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap justify-between gap-3 text-xs font-black uppercase tracking-widest text-slate-500 pt-2 border-t border-slate-100">
+                        <span>{t('usageTotalsLabel')}</span>
+                        <span>
+                          {t('usageTableRequests')}: {formatUsageNumber(usageReport.totals.requestCount)} ·
+                          {` ${t('usageTableInput')}: ${formatUsageNumber(usageReport.totals.inputTokens)} · `}
+                          {`${t('usageTableOutput')}: ${formatUsageNumber(usageReport.totals.outputTokens)} · `}
+                          {`${t('usageTableErrors')}: ${formatUsageNumber(usageReport.totals.errorCount)} · `}
+                          {`${t('usageTableCost')}: ${formatUsageCost(usageReport.totals.cost, usageReport.currency)}`}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {modelAdminError && (
